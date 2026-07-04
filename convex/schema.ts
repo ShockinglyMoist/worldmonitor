@@ -540,7 +540,8 @@ export default defineSchema({
   })
     .index("by_userId", ["userId"])
     .index("by_dodoSubscriptionId", ["dodoSubscriptionId"])
-    .index("by_dodoCustomerId", ["dodoCustomerId"]),
+    .index("by_dodoCustomerId", ["dodoCustomerId"])
+    .index("by_status_period_end", ["status", "currentPeriodEnd"]),
 
   entitlements: defineTable({
     userId: v.string(),

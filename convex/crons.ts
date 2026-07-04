@@ -75,4 +75,11 @@ crons.daily(
   internal.followedCountries._dedupeCountryLocks,
 );
 
+crons.daily(
+  "dodo-renewal-reconciliation",
+  { hourUTC: 3, minuteUTC: 17 },
+  internal.payments.billing.reconcileMissedDodoRenewals,
+  {},
+);
+
 export default crons;
