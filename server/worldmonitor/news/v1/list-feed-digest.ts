@@ -374,6 +374,7 @@ interface ParseResult {
   items: ParsedItem[];
   parsedTotal: number;     // count of <item>/<entry> blocks attempted
   droppedUndated: number;  // count dropped because every recognized date tag was empty/unparseable/future
+  droppedFeedCap?: number; // #4920: items beyond ITEMS_PER_FEED, previously uncounted
 }
 
 // Cache TTLs: a successful parse (parsedTotal > 0) caches for an hour to
@@ -404,7 +405,9 @@ async function fetchAndParseRss(
   // (Same class of cache-prefix bump as v2→v3 and v3→v4, which this codebase
   // already established as the correct cutover pattern for parsed-cache
   // shape changes.)
-  const cacheKey = `rss:feed:v5:${variant}:${feed.url}`;
+  // v5→v6 (#4920 review): ParseResult gained droppedFeedCap; warm v5 rows
+  // lack it and would undercount the coverage ledger for their whole TTL.
+  const cacheKey = `rss:feed:v6:${variant}:${feed.url}`;
 
   try {
     // Read cache unconditionally — the v5 prefix guarantees pre-fix
@@ -521,6 +524,10 @@ function parseRssXml(xml: string, feed: ServerFeed, variant: string): ParseResul
   const isAtom = matches.length === 0;
   if (isAtom) matches = [...xml.matchAll(entryRegex)];
 
+  // #4920 coverage ledger: items beyond the per-feed cap were previously
+  // dropped with no counter anywhere — fully invisible.
+  const droppedFeedCap = Math.max(0, matches.length - ITEMS_PER_FEED);
+
   for (const match of matches.slice(0, ITEMS_PER_FEED)) {
     const block = match[1]!;
 
@@ -618,7 +625,7 @@ function parseRssXml(xml: string, feed: ServerFeed, variant: string): ParseResul
   //     (default 120s) — the feed retries quickly instead of being pinned
   //     empty for the full 3600s TTL.
   if (parsedTotal === 0) return null;
-  return { items, parsedTotal, droppedUndated };
+  return { items, parsedTotal, droppedUndated, droppedFeedCap };
 }
 
 /**
@@ -1188,6 +1195,9 @@ async function writeStoryTracking(items: ParsedItem[], variant: string, lang: st
 async function buildDigest(variant: string, lang: string): Promise<ListFeedDigestResponse> {
   const feedsByCategory = VARIANT_FEEDS[variant] ?? {};
   const feedStatuses: Record<string, string> = {};
+  // #4920 coverage ledger: count every silent drop gate so "how much did
+  // we NOT show" is a queryable number instead of a feeling.
+  const ledgerDrops = { perFeedCap: 0, undated: 0, freshnessFloor: 0, perCategoryCap: 0 };
   const categories: Record<string, CategoryBucket> = {};
 
   const deadlineController = new AbortController();
@@ -1235,16 +1245,23 @@ async function buildDigest(variant: string, lang: string): Promise<ListFeedDiges
           } else if (result.droppedUndated > 0) {
             feedStatuses[feed.name] = 'partial-undated';
           }
-          return { category, items: result.items };
+          return {
+            category,
+            items: result.items,
+            droppedUndated: result.droppedUndated,
+            droppedFeedCap: result.droppedFeedCap ?? 0,
+          };
         }),
       );
 
       for (const result of settled) {
         if (result.status === 'fulfilled') {
-          const { category, items } = result.value;
+          const { category, items, droppedUndated, droppedFeedCap } = result.value;
           const existing = results.get(category) ?? [];
           existing.push(...items);
           results.set(category, existing);
+          ledgerDrops.undated += droppedUndated;
+          ledgerDrops.perFeedCap += droppedFeedCap;
         }
       }
     }
@@ -1268,6 +1285,7 @@ async function buildDigest(variant: string, lang: string): Promise<ListFeedDiges
       droppedStaleTotal += items.length - fresh.length;
       results.set(category, fresh);
     }
+    ledgerDrops.freshnessFloor = droppedStaleTotal;
     if (droppedStaleTotal > 0) {
       console.warn(
         `[digest] freshness floor dropped ${droppedStaleTotal} stale items ` +
@@ -1366,6 +1384,7 @@ async function buildDigest(variant: string, lang: string): Promise<ListFeedDiges
       items.sort((a, b) =>
         b.importanceScore - a.importanceScore || b.publishedAt - a.publishedAt,
       );
+      ledgerDrops.perCategoryCap += Math.max(0, items.length - MAX_ITEMS_PER_CATEGORY);
       slicedByCategory.set(category, items.slice(0, MAX_ITEMS_PER_CATEGORY));
     }
 
@@ -1414,6 +1433,30 @@ async function buildDigest(variant: string, lang: string): Promise<ListFeedDiges
           return toProtoItem(item, storyMeta);
         }),
       };
+    }
+
+    // #4920: publish the coverage ledger — every gate's drop count plus
+    // what survived — as a side key. Best-effort: ledger failures never
+    // fail the digest. Read by ops tooling and the completeness reports;
+    // deliberately NOT part of the proto response (no schema change).
+    const distinctSources = new Set(allItems.map((item) => item.source)).size;
+    const ledger = {
+      v: 1,
+      generatedAt: Date.now(),
+      variant,
+      lang,
+      itemsIngested: allItems.length,
+      itemsServed: allSliced.length,
+      distinctSources,
+      drops: { ...ledgerDrops },
+    };
+    // Key-cardinality clamp: variant/lang are request-supplied — only write
+    // ledgers for known variants and well-formed 2-letter langs so a caller
+    // spraying arbitrary values cannot inflate the keyspace.
+    if (VARIANT_FEEDS[variant] && /^[a-z]{2}$/.test(lang)) {
+      void setCachedJson(`news:coverage-ledger:v1:${variant}:${lang}`, ledger, 7200).catch((err: unknown) =>
+        console.warn('[digest] coverage-ledger write failed:', err),
+      );
     }
 
     return {
