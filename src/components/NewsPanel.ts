@@ -535,10 +535,20 @@ export class NewsPanel extends Panel {
     let newItemIds: Set<string>;
 
     if (this.isFirstRender) {
-      // First render: mark all items as seen
+      // #4923: returning-user continuity. Stories that first appeared
+      // AFTER the previous visit stay NEW on the first render; everything
+      // older is marked seen. First-ever visits (no persisted state)
+      // keep the old mark-everything-seen behavior.
       activityTracker.updateItems(this.panelId, clusterIds);
-      activityTracker.markAsSeen(this.panelId);
-      newItemIds = new Set();
+      const prevVisitAt = activityTracker.getPreviousVisitTime();
+      const newSinceAway = prevVisitAt > 0
+        ? sorted.filter((c) => new Date(c.firstSeen).getTime() > prevVisitAt).map((c) => c.id)
+        : [];
+      newItemIds = new Set(newSinceAway);
+      activityTracker.markItemsSeen(
+        this.panelId,
+        clusterIds.filter((id) => !newItemIds.has(id)),
+      );
       this.isFirstRender = false;
     } else {
       // Subsequent renders: track new items

@@ -17,6 +17,23 @@ export interface ActivityState {
 /** Duration to show "NEW" tag on items (2 minutes) */
 export const NEW_TAG_DURATION_MS = 2 * 60 * 1000;
 
+/**
+ * #4923: persisted read-state. Holds the timestamp of the user's previous
+ * visit so a returning session can distinguish "new since you were last
+ * here" from "new to this page load". Listed in CLOUD_SYNC_KEYS, so
+ * signed-in users get it synced across devices via cloud-prefs-sync with
+ * zero extra wiring here.
+ */
+export const READ_STATE_KEY = 'wm-read-state-v1';
+
+/** Throttle for lastVisitAt writes — markAsSeen fires per scroll/click. */
+const READ_STATE_PERSIST_INTERVAL_MS = 30 * 1000;
+
+interface PersistedReadState {
+  v: 1;
+  lastVisitAt: number;
+}
+
 /** Duration for highlight glow effect (30 seconds) */
 export const HIGHLIGHT_DURATION_MS = 30 * 1000;
 
@@ -24,6 +41,65 @@ class ActivityTracker {
   private panels: Map<string, ActivityState> = new Map();
   private observers: Map<string, IntersectionObserver> = new Map();
   private onChangeCallbacks: Map<string, (newCount: number) => void> = new Map();
+  /** lastVisitAt from the PREVIOUS session, read once at load (0 = none). */
+  private previousVisitAt = 0;
+  private lastPersistAt = 0;
+
+  constructor() {
+    this.loadReadState();
+    if (typeof window !== 'undefined') {
+      // Flush on the way out so the next session's "previous visit" is
+      // accurate even if the throttle window was open.
+      window.addEventListener('beforeunload', () => this.persistLastVisit(true));
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') this.persistLastVisit(true);
+      });
+    }
+  }
+
+  private loadReadState(): void {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const raw = localStorage.getItem(READ_STATE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Partial<PersistedReadState>;
+      if (parsed && typeof parsed.lastVisitAt === 'number' && Number.isFinite(parsed.lastVisitAt)) {
+        this.previousVisitAt = parsed.lastVisitAt;
+      }
+    } catch {
+      // Corrupt state degrades to "no previous visit" — old behavior.
+    }
+  }
+
+  /**
+   * Timestamp of the previous session's last activity (0 when unknown).
+   * Panels use this to keep items that arrived while the user was away
+   * flagged NEW on the first render instead of blanket-marking everything
+   * seen (#4923 — the "every visit is a stateless snapshot" bug).
+   */
+  getPreviousVisitTime(): number {
+    return this.previousVisitAt;
+  }
+
+  private persistLastVisit(force = false): void {
+    if (typeof localStorage === 'undefined') return;
+    const now = Date.now();
+    if (!force && now - this.lastPersistAt < READ_STATE_PERSIST_INTERVAL_MS) return;
+    this.lastPersistAt = now;
+    try {
+      const state: PersistedReadState = { v: 1, lastVisitAt: now };
+      localStorage.setItem(READ_STATE_KEY, JSON.stringify(state));
+    } catch {
+      // Quota/privacy-mode failures degrade to session-only behavior.
+    }
+  }
+
+  /** Test hook: re-read persisted state after stubbing localStorage. */
+  reloadReadStateForTests(): void {
+    this.previousVisitAt = 0;
+    this.lastPersistAt = 0;
+    this.loadReadState();
+  }
 
   /**
    * Initialize tracking for a panel
@@ -96,11 +172,38 @@ class ActivityTracker {
 
     state.newCount = 0;
     state.lastInteraction = Date.now();
+    this.persistLastVisit();
 
     // Notify listeners
     const callback = this.onChangeCallbacks.get(panelId);
     if (callback) {
       callback(0);
+    }
+  }
+
+  /**
+   * Mark a SUBSET of items as seen (#4923). Used on a returning user's
+   * first render: items older than the previous visit are seen, items
+   * that arrived while away keep their NEW state.
+   */
+  markItemsSeen(panelId: string, itemIds: string[]): void {
+    const state = this.panels.get(panelId);
+    if (!state) return;
+
+    for (const id of itemIds) {
+      state.seenIds.add(id);
+    }
+    let unseen = 0;
+    for (const id of state.firstSeenTime.keys()) {
+      if (!state.seenIds.has(id)) unseen++;
+    }
+    state.newCount = unseen;
+    state.lastInteraction = Date.now();
+    this.persistLastVisit();
+
+    const callback = this.onChangeCallbacks.get(panelId);
+    if (callback) {
+      callback(state.newCount);
     }
   }
 
