@@ -150,11 +150,8 @@ function noticeForRow(
 }
 
 // A recognized Axiom `?format=legacy` result envelope carries its rows under one
-// of these array fields — an EMPTY array is a valid "no rows" result. Anything
-// else at HTTP 200 (an error object, a drifted schema, a bare non-result body)
-// is NOT a result: it must block the dimension, never read as zero usage, or the
-// recovery sweep would treat it as "healthy but empty" and false-clear live
-// notices. Keep the branches in sync with normalizeAxiomRows.
+// of these array fields — an EMPTY array is a valid "no rows" result. Keep the
+// branches in sync with normalizeAxiomRows.
 function isRecognizedAxiomResultShape(data: unknown): boolean {
   const d = data as any;
   return (
@@ -162,6 +159,22 @@ function isRecognizedAxiomResultShape(data: unknown): boolean {
     Array.isArray(d?.tables?.[0]?.rows) ||
     Array.isArray(d?.rows)
   );
+}
+
+// Decide whether an HTTP-200 body that ISN'T a recognized result envelope should
+// BLOCK the dimension (a genuine Axiom error) or be read as an EMPTY result.
+// Block only when the body is a non-object or carries an explicit Axiom error
+// signature (error / message / code). An unrecognized-but-error-free object is
+// treated as empty (normalizeAxiomRows yields []): this is deliberately biased
+// toward "empty" so a drift in the shape of the EMPTY summarize response can't
+// classify every routine no-burst scan as axiom_unexpected_body and freeze every
+// open burst notice via the recovery sweep. A real Axiom failure still carries an
+// error field and blocks, and a genuine outage rejects the fetch (axiom_query_error).
+function isAxiomErrorBody(data: unknown): boolean {
+  if (data == null || typeof data !== "object") return true;
+  if (isRecognizedAxiomResultShape(data)) return false;
+  const d = data as any;
+  return typeof d.error !== "undefined" || typeof d.message === "string" || typeof d.code !== "undefined";
 }
 
 function normalizeAxiomRows(data: unknown, dimension: PlanLimitDimension): ScannerUsageRow[] {
@@ -220,10 +233,11 @@ async function queryAxiom(apl: string, dimension: PlanLimitDimension): Promise<{
       return { rows: [], blockedReason: `axiom_query_http_${resp.status}` };
     }
     const json = await resp.json();
-    if (!isRecognizedAxiomResultShape(json)) {
-      // HTTP 200 but not a result envelope — an Axiom error body or drifted
-      // schema. Block the dimension instead of letting normalizeAxiomRows yield
-      // an empty [] that reads identically to a genuinely-empty result.
+    if (isAxiomErrorBody(json)) {
+      // HTTP 200 carrying an Axiom error signature (or a non-object body). Block
+      // the dimension instead of letting normalizeAxiomRows yield an empty [] that
+      // reads identically to a genuinely-empty result. A recognized-or-plausibly-
+      // empty body falls through and normalizes (to [] when it has no rows).
       return { rows: [], blockedReason: "axiom_unexpected_body" };
     }
     return { rows: normalizeAxiomRows(json, dimension) };
@@ -329,9 +343,19 @@ async function buildProductionRows(
   // userId, in the Upstash-gated block below (not an Axiom count() by customer_id).
   // The per-minute burst axis stays Axiom-derived: the rl:apikey:min meter is a
   // single counter with no 5-bucket history to express sustained_burst.
+  //
+  // Count real API traffic: successful requests AND per-minute rate-limit
+  // rejections. In shadow mode (API_RATE_LIMIT_ENFORCE off) an over-limit request
+  // is served 200 with reason rl_min_shadow, so `status < 400` alone catches it —
+  // but once enforcement flips on, over-limit requests become 429 (rl_min_429) and
+  // a bare `status < 400` would DROP exactly the excess traffic that defines a
+  // sustained burst, capping the per-minute count at the limit so the notice
+  // silently dies at enforcement. Include the rl_min_* reasons so burst detection
+  // survives the shadow→enforce transition. Genuine errors (auth 401/403,
+  // malformed) stay excluded — they are not usage.
   const burstApl = `['wm_api_usage']
 | where event_type == "request" and _time > ago(10m)
-| where auth_kind in ("user_api_key", "enterprise_api_key") and status < 400
+| where auth_kind in ("user_api_key", "enterprise_api_key") and (status < 400 or reason in ("rl_min_429", "rl_min_shadow"))
 | where isnotnull(customer_id) and customer_id != ""
 | summarize usage = count() by customer_id, minute = bin(_time, 1m)`;
   const burst = await queryAxiom(burstApl, "api_minute_burst");
@@ -492,6 +516,14 @@ async function scanHandler(ctx: any, args: {
     : await buildProductionRows(active, now);
   summary.blocked.push(...source.blocked);
 
+  // (user::dimension) pairs the loop actually EVALUATED this scan. The recovery
+  // sweep below keys off this set — NOT all source.rows — so a row that was gated
+  // out (no_api_access) or couldn't be joined to an entitlement stays sweep-
+  // eligible. Otherwise its (user, dimension) would count as "handled" and a
+  // stale api_* notice on a now-non-apiAccess account (downgrade, or a legacy
+  // notice minted before this gate) would never clear.
+  const evaluated = new Set<string>();
+
   for (const row of source.rows) {
     const ent = byUser.get(row.userId);
     if (!ent) {
@@ -514,6 +546,7 @@ async function scanHandler(ctx: any, args: {
     const limit = getPlanLimit(planKey, row.dimension);
     const window = windowForDimension(row.dimension, now);
     summary.evaluated += 1;
+    evaluated.add(`${row.userId}::${row.dimension}`);
 
     const notice = noticeForRow(row, planKey, limit);
     if (notice?.blockedReason) {
@@ -579,7 +612,6 @@ async function scanHandler(ctx: any, args: {
   // whose data source is healthy, clear it: no usage row from a healthy source
   // means the user has fallen back under the threshold.
   if (!dryRun) {
-    const seen = new Set(source.rows.map((row) => `${row.userId}::${row.dimension}`));
     // Source-level outages (missing token, HTTP error, absent Upstash creds)
     // land in `source.blocked` WITHOUT a userId. Never treat a blocked source
     // as "recovered" — a transient Axiom/Redis failure must not silently clear
@@ -598,7 +630,7 @@ async function scanHandler(ctx: any, args: {
     ) as Array<{ userId: string; dimension: PlanLimitDimension }>;
     for (const key of openKeys) {
       const pair = `${key.userId}::${key.dimension}`;
-      if (seen.has(pair)) continue; // evaluated this scan — handled by the loop above
+      if (evaluated.has(pair)) continue; // evaluated this scan — handled by the loop above
       if (blockedDimensions.has(key.dimension)) continue;
       if (blockedUserDimensions.has(pair)) continue;
       const result = await ctx.runMutation(
