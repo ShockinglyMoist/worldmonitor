@@ -1442,7 +1442,9 @@
       "tonePositive": "Pozitív",
       "overall": "Összes: {{tone}}",
       "signalTypesEvents": "{{types}} szignáltípus • {{events}} esemény",
-      "newsSignals": "{{news}} hír • {{signals}} szignál"
+      "newsSignals": "{{news}} hír • {{signals}} szignál",
+      "provenanceTitle": "Lefedettség eredete: hány feldolgozott történetből és különálló forrásból választotta ki ezt az összefoglalót",
+      "compiledFrom": "{{stories}} történetből és {{sources}} forrásból összeállítva"
     },
     "settings": {
       "exportSettings": "Beállítások exportálása",

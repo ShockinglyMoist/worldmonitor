@@ -32,6 +32,13 @@ export interface ServerInsights {
   clusterCount: number;
   multiSourceCount: number;
   fastMovingCount: number;
+  /** #4920 coverage provenance — present on payloads seeded after the
+   * completeness-measurement rollout; absent on older cached payloads. */
+  provenance?: {
+    storiesConsidered: number;
+    sourcesConsidered: number;
+    selectionDrops?: { admissibility: number; sourceCap: number; overflow: number };
+  };
 }
 
 let cached: ServerInsights | null = null;

@@ -397,7 +397,9 @@ async function fetchInsights() {
   const clusters = clusterItems(normalizedItems);
   console.log(`  Clusters: ${clusters.length}`);
 
-  const topStories = selectTopStories(clusters, 8);
+  // #4920 coverage ledger: capture what the selection gates dropped.
+  const selectionStats = {};
+  const topStories = selectTopStories(clusters, 8, selectionStats);
   console.log(`  Top stories: ${topStories.length}`);
   const observability = buildImportanceObservability(clusters, topStories);
   console.log(
@@ -507,6 +509,23 @@ async function fetchInsights() {
     };
   });
 
+  // #4920: user-facing provenance — "compiled from N stories across M
+  // sources" — plus the selection-gate drop counts. Read by
+  // insights-loader/InsightsPanel; no proto involved (plain Redis JSON).
+  const provenance = {
+    storiesConsidered: normalizedItems.length,
+    sourcesConsidered: new Set(normalizedItems.map(item => item.source).filter(Boolean)).size,
+    selectionDrops: {
+      admissibility: selectionStats.admissibilityDropped ?? 0,
+      sourceCap: selectionStats.sourceCapDropped ?? 0,
+      overflow: selectionStats.overflowDropped ?? 0,
+    },
+  };
+  console.log(
+    `  Provenance: ${provenance.storiesConsidered} stories / ${provenance.sourcesConsidered} sources; ` +
+      `drops adm=${provenance.selectionDrops.admissibility} srcCap=${provenance.selectionDrops.sourceCap} overflow=${provenance.selectionDrops.overflow}`,
+  );
+
   const payload = {
     worldBrief,
     worldBriefSources,
@@ -519,6 +538,7 @@ async function fetchInsights() {
     multiSourceCount,
     fastMovingCount,
     importanceSignals: observability,
+    provenance,
   };
 
   // LKG preservation: don't overwrite "ok" with "degraded"

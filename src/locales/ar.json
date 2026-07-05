@@ -1263,7 +1263,9 @@
       "sources_zero": "{{count}} مصادر",
       "sources_two": "{{count}} مصدران",
       "sources_few": "{{count}} مصادر",
-      "sources_many": "{{count}} مصدر"
+      "sources_many": "{{count}} مصدر",
+      "provenanceTitle": "أصل التغطية: عدد القصص المأخوذة والمصادر المميزة التي تم اختيار هذا الملخص منها",
+      "compiledFrom": "مجمّع من {{stories}} قصة عبر {{sources}} مصادر"
     },
     "cascade": {
       "filters": {

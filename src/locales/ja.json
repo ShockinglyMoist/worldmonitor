@@ -1302,7 +1302,9 @@
       "tonePositive": "ポジティブ",
       "overall": "全体: {{tone}}",
       "signalTypesEvents": "{{types}} シグナルタイプ • {{events}} イベント",
-      "newsSignals": "{{news}} ニュース • {{signals}} シグナル"
+      "newsSignals": "{{news}} ニュース • {{signals}} シグナル",
+      "provenanceTitle": "カバレッジプロヴェナンス: このブリーフが選択された取り込まれたストーリーと個別ソースの数",
+      "compiledFrom": "{{stories}}件のストーリーから{{sources}}個のソースをコンパイル"
     },
     "settings": {
       "exportSettings": "設定をエクスポート",

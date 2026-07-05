@@ -304,29 +304,50 @@ export function computeEntityCorroboration(clusters, nowMs = Date.now()) {
 
 // Note: velocity filter omitted (vs frontend selectTopStories) because digest
 // items lack velocity data. Phase B may add velocity when RPC provides it.
-export function selectTopStories(clusters, maxCount = 8) {
+/**
+ * @param {object[]} clusters
+ * @param {number} [maxCount]
+ * @param {{ considered?: number; admissibilityDropped?: number; sourceCapDropped?: number; overflowDropped?: number }} [stats]
+ *   #4920 coverage ledger: when provided, populated with how many clusters
+ *   each gate dropped — previously all three gates were silent.
+ */
+export function selectTopStories(clusters, maxCount = 8, stats) {
   const nowMs = Date.now();
   computeEntityCorroboration(clusters, nowMs);
-  const scored = clusters
-    .map(c => {
-      const score = scoreImportance(c);
-      return { cluster: c, score, effectiveScore: score * recencyWeight(c, nowMs) };
-    })
-    .filter(({ cluster: c, score }) => isTopStoriesAdmissible(c, score))
-    .sort((a, b) => b.effectiveScore - a.effectiveScore || b.score - a.score);
+  const admissible = [];
+  let admissibilityDropped = 0;
+  for (const c of clusters) {
+    const score = scoreImportance(c);
+    if (isTopStoriesAdmissible(c, score)) {
+      admissible.push({ cluster: c, score, effectiveScore: score * recencyWeight(c, nowMs) });
+    } else {
+      admissibilityDropped++;
+    }
+  }
+  admissible.sort((a, b) => b.effectiveScore - a.effectiveScore || b.score - a.score);
 
   const selected = [];
   const sourceCount = new Map();
   const MAX_PER_SOURCE = 3;
+  let sourceCapDropped = 0;
 
-  for (const { cluster, score, effectiveScore } of scored) {
+  for (const { cluster, score, effectiveScore } of admissible) {
+    if (selected.length >= maxCount) break;
     const source = cluster.primarySource;
     const count = sourceCount.get(source) || 0;
     if (count < MAX_PER_SOURCE) {
       selected.push({ ...cluster, importanceScore: score, effectiveImportanceScore: effectiveScore });
       sourceCount.set(source, count + 1);
+    } else {
+      sourceCapDropped++;
     }
-    if (selected.length >= maxCount) break;
+  }
+
+  if (stats && typeof stats === 'object') {
+    stats.considered = clusters.length;
+    stats.admissibilityDropped = admissibilityDropped;
+    stats.sourceCapDropped = sourceCapDropped;
+    stats.overflowDropped = Math.max(0, admissible.length - selected.length - sourceCapDropped);
   }
 
   return selected;

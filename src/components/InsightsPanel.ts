@@ -523,6 +523,7 @@ export class InsightsPanel extends Panel {
     const sentimentOverview = this.renderSentimentOverview(sentiments);
     const storiesHtml = this.renderServerStories(insights.topStories, sentiments);
     const statsHtml = this.renderServerStats(insights);
+    const provenanceHtml = this.renderProvenance(insights);
     const missedHtml = this.renderMissedStories();
 
     this.setSafeContent(unsafeRawHtml(`
@@ -531,6 +532,7 @@ export class InsightsPanel extends Panel {
       ${convergenceHtml}
       ${sentimentOverview}
       ${statsHtml}
+      ${provenanceHtml}
       <div class="insights-section">
         <div class="insights-section-title">${t('components.insights.breakingConfirmed')}</div>
         ${storiesHtml}
@@ -576,6 +578,20 @@ export class InsightsPanel extends Panel {
         </div>
       `;
     }).join('');
+  }
+
+  private renderProvenance(insights: ServerInsights): string {
+    // #4920: the completeness stamp. Absent on pre-rollout payloads.
+    const prov = insights.provenance;
+    if (!prov || !prov.storiesConsidered) return '';
+    return `
+      <div class="insights-provenance" title="${t('components.insights.provenanceTitle')}">
+        ${t('components.insights.compiledFrom', {
+          stories: String(prov.storiesConsidered),
+          sources: String(prov.sourcesConsidered),
+        })}
+      </div>
+    `;
   }
 
   private renderServerStats(insights: ServerInsights): string {

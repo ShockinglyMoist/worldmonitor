@@ -34,6 +34,9 @@ const BOOTSTRAP_KEYS = {
   naturalEvents:     'natural:events:v1',
   flightDelays:      'aviation:delays-bootstrap:v2',
   newsInsights:      'news:insights:v1',
+  // #4920 completeness measurement (daily GH Actions publishers)
+  newsFeedHealth:    'news:feed-health:v1',
+  newsRecallBenchmark: 'news:recall-benchmark:v1',
   predictionMarkets: 'prediction:markets-bootstrap:v1',
   cryptoQuotes:      'market:crypto:v1',
   gulfQuotes:        'market:gulf-quotes:v1',
@@ -260,6 +263,9 @@ const SEED_META = {
   notamClosures:    { key: 'seed-meta:aviation:notam',          maxStaleMin: 240 }, // 2h interval; 240min = 2x interval
   predictionMarkets: { key: 'seed-meta:prediction:markets',     maxStaleMin: 90 },
   newsInsights:     { key: 'seed-meta:news:insights',           maxStaleMin: 30 },
+  // #4920: daily GH Actions cadence; 2880 = 2x — one fully missed day alarms
+  newsFeedHealth:   { key: 'seed-meta:news:feed-health',        maxStaleMin: 2880 },
+  newsRecallBenchmark: { key: 'seed-meta:news:recall-benchmark', maxStaleMin: 2880 },
   marketQuotes:     { key: 'seed-meta:market:stocks',         maxStaleMin: 30 },
   commodityQuotes:  { key: 'seed-meta:market:commodities',    maxStaleMin: 30 },
   goldExtended:     { key: 'seed-meta:market:gold-extended',  maxStaleMin: 30 },

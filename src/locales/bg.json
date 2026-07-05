@@ -1302,7 +1302,9 @@
       "tonePositive": "Положителен",
       "overall": "Обобщено: {{tone}}",
       "signalTypesEvents": "{{types}} типа сигнали • {{events}} събития",
-      "newsSignals": "{{news}} новини • {{signals}} сигнали"
+      "newsSignals": "{{news}} новини • {{signals}} сигнали",
+      "provenanceTitle": "Произход на обхвата: колко включени истории и отделни източници е избрано от този преглед",
+      "compiledFrom": "Събрано от {{stories}} истории в {{sources}} източници"
     },
     "settings": {
       "exportSettings": "Експорт на настройки",

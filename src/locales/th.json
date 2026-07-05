@@ -1302,7 +1302,9 @@
       "tonePositive": "บวก",
       "overall": "โดยรวม: {{tone}}",
       "signalTypesEvents": "{{types}} ประเภทสัญญาณ • {{events}} เหตุการณ์",
-      "newsSignals": "{{news}} ข่าว • {{signals}} สัญญาณ"
+      "newsSignals": "{{news}} ข่าว • {{signals}} สัญญาณ",
+      "provenanceTitle": "ความมาของการครอบคลุม: จำนวนเรื่องข่าวที่นำเข้าและแหล่งข่าวที่แตกต่างกันที่ใช้สำหรับสรุปนี้",
+      "compiledFrom": "รวบรวมจาก {stories} เรื่องราวจาก {sources} แหล่งที่มา"
     },
     "settings": {
       "exportSettings": "ส่งออกการตั้งค่า",
