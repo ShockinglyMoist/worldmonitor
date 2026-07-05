@@ -44,17 +44,49 @@ class ActivityTracker {
   /** lastVisitAt from the PREVIOUS session, read once at load (0 = none). */
   private previousVisitAt = 0;
   private lastPersistAt = 0;
+  private lifecycleInstalled = false;
 
   constructor() {
+    // Constructor stays side-effect-light (a single localStorage read);
+    // window/document listeners install lazily on first register() —
+    // mirrors the repo's explicit-install convention (cloud-prefs-sync
+    // install()) without adding a bootstrap call site.
     this.loadReadState();
-    if (typeof window !== 'undefined') {
-      // Flush on the way out so the next session's "previous visit" is
-      // accurate even if the throttle window was open.
-      window.addEventListener('beforeunload', () => this.persistLastVisit(true));
-      document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'hidden') this.persistLastVisit(true);
-      });
-    }
+  }
+
+  private installLifecycleListeners(): void {
+    if (this.lifecycleInstalled || typeof window === 'undefined') return;
+    this.lifecycleInstalled = true;
+    // Flush on the way out so the next session's "previous visit" is
+    // accurate even if the throttle window was open. visibilitychange is
+    // the reliable signal on mobile Safari; beforeunload is the desktop
+    // belt-and-braces.
+    window.addEventListener('beforeunload', () => this.persistLastVisit(true));
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') this.persistLastVisit(true);
+    });
+    // Cross-device continuity: when cloud prefs land AFTER module load
+    // (sign-in mid-session, another device visited more recently), adopt
+    // the newer previous-visit timestamp — otherwise the cloud value is
+    // silently ignored until the next full reload.
+    window.addEventListener('wm:cloud-prefs-applied', (event) => {
+      const keys = (event as CustomEvent<{ keys?: string[] }>).detail?.keys;
+      if (Array.isArray(keys) && keys.includes(READ_STATE_KEY)) {
+        this.refreshPreviousVisitFromStorage();
+      }
+    });
+  }
+
+  /** Adopt a LATER previous-visit timestamp written by cloud sync. */
+  private refreshPreviousVisitFromStorage(): void {
+    const before = this.previousVisitAt;
+    const current = this.previousVisitAt;
+    this.previousVisitAt = 0;
+    this.loadReadState();
+    // Monotonic: another device's more recent visit advances the marker;
+    // an older cloud value must not resurrect already-seen NEW state.
+    if (this.previousVisitAt < current) this.previousVisitAt = current;
+    if (this.previousVisitAt !== before) this.lastPersistAt = 0;
   }
 
   private loadReadState(): void {
@@ -64,7 +96,13 @@ class ActivityTracker {
       if (!raw) return;
       const parsed = JSON.parse(raw) as Partial<PersistedReadState>;
       if (parsed && typeof parsed.lastVisitAt === 'number' && Number.isFinite(parsed.lastVisitAt)) {
-        this.previousVisitAt = parsed.lastVisitAt;
+        // Clock-skew guard: a future timestamp (device clock jumped back
+        // after writing, or a corrupt cloud value) would blank every NEW
+        // tag for the whole session. Tolerate small skew, ignore beyond it.
+        const maxPlausible = Date.now() + 10 * 60 * 1000;
+        if (parsed.lastVisitAt <= maxPlausible) {
+          this.previousVisitAt = parsed.lastVisitAt;
+        }
       }
     } catch {
       // Corrupt state degrades to "no previous visit" — old behavior.
@@ -95,7 +133,7 @@ class ActivityTracker {
   }
 
   /** Test hook: re-read persisted state after stubbing localStorage. */
-  reloadReadStateForTests(): void {
+  _reloadReadStateForTests(): void {
     this.previousVisitAt = 0;
     this.lastPersistAt = 0;
     this.loadReadState();
@@ -105,6 +143,7 @@ class ActivityTracker {
    * Initialize tracking for a panel
    */
   register(panelId: string): void {
+    this.installLifecycleListeners();
     if (!this.panels.has(panelId)) {
       this.panels.set(panelId, {
         seenIds: new Set(),
