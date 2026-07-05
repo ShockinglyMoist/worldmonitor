@@ -34,9 +34,6 @@ const BOOTSTRAP_KEYS = {
   naturalEvents:     'natural:events:v1',
   flightDelays:      'aviation:delays-bootstrap:v2',
   newsInsights:      'news:insights:v1',
-  // #4920 completeness measurement (daily GH Actions publishers)
-  newsFeedHealth:    'news:feed-health:v1',
-  newsRecallBenchmark: 'news:recall-benchmark:v1',
   predictionMarkets: 'prediction:markets-bootstrap:v1',
   cryptoQuotes:      'market:crypto:v1',
   gulfQuotes:        'market:gulf-quotes:v1',
@@ -111,6 +108,10 @@ const BOOTSTRAP_KEYS = {
 };
 
 const STANDALONE_KEYS = {
+  // #4920 completeness measurement (daily GH Actions publishers) — ops
+  // keys: health-monitored but NOT bootstrap-hydrated into page loads.
+  newsFeedHealth:    'news:feed-health:v1',
+  newsRecallBenchmark: 'news:recall-benchmark:v1',
   serviceStatuses:       'infra:service-statuses:v1',
   macroSignals:          'economic:macro-signals:v1',
   bisPolicy:             'economic:bis:policy:v1',
