@@ -101,7 +101,9 @@ export function parseWhyMatters(text) {
 
 /**
  * Deterministic 16-char hex hash of the SIX story fields that flow
- * into the whyMatters prompt (5 core + description). Cache identity
+ * into the whyMatters prompt (5 core + description). Also consumed by
+ * server/worldmonitor/intelligence/v1/get-country-intel-brief.ts
+ * (citation verification + grounding telemetry, #4921). Cache identity
  * MUST cover every field that shapes the LLM output, or two requests
  * with the same core fields but different descriptions will share a
  * cache entry and the second caller gets prose grounded in the first
@@ -960,7 +962,9 @@ export function verifyCitationIndexes(text, sourceCount) {
   }
   const max = Number.isFinite(sourceCount) && sourceCount > 0 ? Math.floor(sourceCount) : 0;
   let stripped = 0;
-  const cleaned = text.replace(/\s*\[(\d{1,2})\]/g, (full, numStr) => {
+  // 1-3 digits: [123] must not sail through unverified (review finding);
+  // 4+ digit brackets ([2026]) are treated as prose, not citations.
+  const cleaned = text.replace(/\s*\[(\d{1,3})\]/g, (full, numStr) => {
     const n = Number.parseInt(numStr, 10);
     if (n >= 1 && n <= max) return full;
     stripped++;

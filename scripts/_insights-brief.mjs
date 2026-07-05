@@ -2,6 +2,11 @@
 // so tests can import without triggering the top-level runSeed() call.
 
 import { isBriefLeadEligible } from './_clustering.mjs';
+import {
+  validateNoHallucinatedProperNouns,
+  checkLeadGrounding,
+  verifyCitationIndexes,
+} from './shared/brief-llm-core.js';
 
 /**
  * Choose which clustered story to summarize for the WORLD BRIEF.
@@ -114,4 +119,87 @@ export function parseBriefSynthesis(rawText, storyCount) {
       .sort((a, b) => a[0] - b[0])
       .map(([n, lineText]) => ({ n, text: lineText })),
   };
+}
+
+/**
+ * #4921/#4928: assemble the synthesized brief from a raw LLM response —
+ * pure and fully unit-testable. Applies the whole contract:
+ *   - parse (fence-tolerant JSON, ≥half the stories lined)
+ *   - editorial gate: at least one top story must be corroborated
+ *     (≥2 sources / entity corroboration) — the synthesis path must not
+ *     lower the legacy corroboration bar on all-single-source days
+ *   - lead: proper-noun validation against ALL story titles (enforce →
+ *     reject to fallback), anchor grounding, citation-index verification
+ *   - lines: per-story proper-noun enforcement (a failing line degrades
+ *     to its own headline, keeping its [n] so the citation contract holds)
+ *   - sources: STRICT lockstep with citation indexes — entry i is always
+ *     story i+1, substituting a minimal fallback when a story lacks a
+ *     usable link (never filtered, or every later [n] would shift)
+ *
+ * @returns {null | {
+ *   lead: string;
+ *   lines: Array<{ n: number; text: string }>;
+ *   sources: Array<{ title: string; source: string; url: string }>;
+ *   hallucinatedLines: number;
+ *   strippedCitations: number;
+ * }} null → caller falls back to the legacy single-headline path.
+ */
+export function composeSynthesizedBrief(rawText, topStories, opts = {}) {
+  const validatorMode = opts.validatorMode === 'shadow' ? 'shadow' : 'enforce';
+  const sanitize = typeof opts.sanitizeTitle === 'function' ? opts.sanitizeTitle : (t) => t;
+  const sourceFromStory = typeof opts.sourceFromStory === 'function' ? opts.sourceFromStory : () => null;
+
+  if (!Array.isArray(topStories) || topStories.length === 0) return null;
+  // Editorial gate: same bar the legacy pickBriefCluster enforced.
+  if (!topStories.some(isBriefLeadEligible)) return null;
+
+  const parsed = parseBriefSynthesis(rawText, topStories.length);
+  if (!parsed) return null;
+
+  const allTitles = topStories.map((story) => story.primaryTitle).join(' — ');
+  const groundingStories = topStories.map((story) => ({ headline: story.primaryTitle }));
+
+  // Lead gates: invented proper nouns are a hard reject in enforce mode
+  // (anchor PRESENCE via checkLeadGrounding is necessary but not
+  // sufficient — a lead can name one real anchor and still fabricate).
+  const leadValidation = validateNoHallucinatedProperNouns(parsed.lead, allTitles);
+  if (!leadValidation.ok && validatorMode === 'enforce') return null;
+  if (!checkLeadGrounding({ lead: parsed.lead }, groundingStories, topStories.length)) return null;
+
+  let strippedCitations = 0;
+  const leadCheck = verifyCitationIndexes(parsed.lead, topStories.length);
+  strippedCitations += leadCheck.stripped;
+
+  const lineByIndex = new Map(parsed.lines.map((line) => [line.n, line.text]));
+  let hallucinatedLines = 0;
+  const lines = topStories.map((story, i) => {
+    const n = i + 1;
+    const headline = sanitize(story.primaryTitle);
+    const raw = lineByIndex.get(n);
+    // Missing/degraded lines keep their citation so the contract
+    // ("every line ends with its [n]") holds for renderers.
+    if (!raw) return { n, text: `${headline} [${n}]` };
+    const lineCitations = verifyCitationIndexes(raw, topStories.length);
+    strippedCitations += lineCitations.stripped;
+    const groundText = [story.primaryTitle, ...(Array.isArray(story.memberTitles) ? story.memberTitles : [])].join(' — ');
+    const validation = validateNoHallucinatedProperNouns(lineCitations.text, groundText);
+    if (!validation.ok) {
+      hallucinatedLines++;
+      if (validatorMode === 'enforce') return { n, text: `${headline} [${n}]` };
+    }
+    return { n, text: lineCitations.text };
+  });
+
+  // STRICT index lockstep: never filter — substitute.
+  const sources = topStories.map((story) => {
+    const source = sourceFromStory(story);
+    if (source) return source;
+    return {
+      title: sanitize(story.primaryTitle) || 'Untitled',
+      source: story.primarySource || 'Unknown',
+      url: '',
+    };
+  });
+
+  return { lead: leadCheck.text, lines, sources, hallucinatedLines, strippedCitations };
 }

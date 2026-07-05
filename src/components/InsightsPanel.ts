@@ -622,7 +622,11 @@ export class InsightsPanel extends Panel {
     const sources = insights.worldBriefSources ?? [];
     const linesHtml = lines.length > 0
       ? `<ol class="insights-brief-lines">${lines
-          .map((line) => `<li>${formatIntelBrief(line.text, { sources }).replace(/^<p>|<\/p>$/g, '')}</li>`)
+          .map((line) => `<li>${formatIntelBrief(line.text, { sources })
+            .replace(/^<div class="brief-para">/, '')
+            .replace(/<\/div>$/, '')
+            .replace(/^<p>/, '')
+            .replace(/<\/p>$/, '')}</li>`)
           .join('')}</ol>`
       : '';
     let footer = '';

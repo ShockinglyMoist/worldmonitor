@@ -146,13 +146,13 @@ describe('grounding spine port (#4921)', () => {
 });
 
 describe('brief-contract wiring (source-textual)', () => {
-  it('seed-insights runs the synthesis path with enforce-by-default validation', () => {
+  it('seed-insights runs the synthesis path through the pure composer with enforce-by-default', () => {
     const src = readSrc('scripts/seed-insights.mjs');
     assert.match(src, /synthesisSystemPrompt/);
-    assert.match(src, /parseBriefSynthesis\(synthesisResult\.text, topStories\.length\)/);
-    assert.match(src, /checkLeadGrounding\(\{ lead: parsed\.lead \}/);
-    assert.match(src, /verifyCitationIndexes\(parsed\.lead/);
+    assert.match(src, /composeSynthesizedBrief\(synthesisResult\.text, topStories, \{/);
+    assert.match(src, /validatorMode: BRIEF_VALIDATOR_MODE/);
     assert.match(src, /=== 'shadow' \? 'shadow' : 'enforce'/, 'enforce must be the default mode');
+    assert.match(src, /generateLegacySingleHeadlineBrief\(topStories\)/, 'L2 fallback must be wired');
     assert.match(src, /briefStoryLines/);
     assert.match(src, /sourceAgeRange/);
   });
@@ -173,5 +173,111 @@ describe('brief-contract wiring (source-textual)', () => {
   it('core and mirrors are byte-identical (grounding spine included)', () => {
     assert.equal(readSrc('shared/brief-llm-core.js'), readSrc('scripts/shared/brief-llm-core.js'));
     assert.equal(readSrc('shared/brief-llm-core.d.ts'), readSrc('scripts/shared/brief-llm-core.d.ts'));
+  });
+});
+
+// ── #4928 review-round additions ───────────────────────────────────────────
+
+import { composeSynthesizedBrief } from '../scripts/_insights-brief.mjs';
+
+describe('composeSynthesizedBrief (functional L1 coverage, #4928 review)', () => {
+  const CORROBORATED = [
+    { primaryTitle: 'Iran threatens to close Strait of Hormuz', primarySource: 'Reuters', primaryLink: 'https://r/1', pubDate: '2026-07-06T01:00:00Z', sources: ['Reuters', 'BBC'] },
+    { primaryTitle: 'Turkey hikes interest rates to 50%', primarySource: 'Bloomberg', primaryLink: 'https://b/2', pubDate: '2026-07-06T02:00:00Z', sources: ['Bloomberg'] },
+  ];
+  const GOOD = JSON.stringify({
+    lead: 'Iran raises the stakes around Hormuz [1] while Turkey delivers a dramatic rate hike [2].',
+    lines: [
+      { n: 1, text: 'Iran threatens to close the Strait of Hormuz [1].' },
+      { n: 2, text: 'Turkey raises interest rates to 50% [2].' },
+    ],
+  });
+  const passOpts = { validatorMode: 'enforce', sourceFromStory: (s) => ({ title: s.primaryTitle, source: s.primarySource, url: s.primaryLink }) };
+
+  it('happy path: lead + locked lines + lockstep sources', () => {
+    const out = composeSynthesizedBrief(GOOD, CORROBORATED, passOpts);
+    assert.ok(out);
+    assert.match(out.lead, /Hormuz \[1\]/);
+    assert.equal(out.lines.length, 2);
+    assert.equal(out.sources.length, 2);
+    assert.equal(out.sources[1].url, 'https://b/2');
+  });
+
+  it('REGRESSION: a story without a usable link gets a substitute source entry, never shifting [n] mapping', () => {
+    const out = composeSynthesizedBrief(GOOD, CORROBORATED, {
+      ...passOpts,
+      sourceFromStory: (s) => (s.primarySource === 'Reuters' ? null : { title: s.primaryTitle, source: s.primarySource, url: s.primaryLink }),
+    });
+    assert.ok(out);
+    assert.equal(out.sources.length, 2, 'sources must stay index-locked');
+    assert.equal(out.sources[0].url, '', 'missing link → substitute entry, not filtered');
+    assert.equal(out.sources[1].url, 'https://b/2', '[2] still points at story 2');
+  });
+
+  it('editorial gate: all-single-source days reject L1 (legacy corroboration bar preserved)', () => {
+    const singles = CORROBORATED.map((s) => ({ ...s, sources: [s.primarySource] }));
+    assert.equal(composeSynthesizedBrief(GOOD, singles, passOpts), null);
+  });
+
+  it('lead inventing a proper noun is rejected in enforce mode (falls back)', () => {
+    const fabricated = JSON.stringify({
+      lead: 'President Macron condemned the Hormuz escalation [1] as Turkey hiked rates [2].',
+      lines: [
+        { n: 1, text: 'Iran threatens to close the Strait of Hormuz [1].' },
+        { n: 2, text: 'Turkey raises interest rates to 50% [2].' },
+      ],
+    });
+    assert.equal(composeSynthesizedBrief(fabricated, CORROBORATED, passOpts), null);
+  });
+
+  it('a line inventing a proper noun degrades to its headline WITH its citation', () => {
+    const badLine = JSON.stringify({
+      lead: 'Iran raises the stakes around Hormuz [1] while Turkey delivers a dramatic rate hike [2].',
+      lines: [
+        { n: 1, text: 'Ayatollah Nasrallah vows to close the Strait of Hormuz [1].' },
+        { n: 2, text: 'Turkey raises interest rates to 50% [2].' },
+      ],
+    });
+    const out = composeSynthesizedBrief(badLine, CORROBORATED, passOpts);
+    assert.ok(out);
+    assert.equal(out.hallucinatedLines, 1);
+    assert.equal(out.lines[0].text, 'Iran threatens to close Strait of Hormuz [1]', 'degraded line keeps [n]');
+  });
+
+  it('missing line fills from headline with its citation', () => {
+    const partial = JSON.stringify({
+      lead: 'Iran raises the stakes around Hormuz [1] while Turkey delivers a dramatic rate hike [2].',
+      lines: [{ n: 1, text: 'Iran threatens to close the Strait of Hormuz [1].' }],
+    });
+    const out = composeSynthesizedBrief(partial, CORROBORATED, passOpts);
+    assert.ok(out);
+    assert.match(out.lines[1].text, /\[2\]$/);
+  });
+});
+
+describe('boundary + contract pins (#4928 review)', () => {
+  it('parser lead-length bounds are inclusive at 40 and 700', () => {
+    const mk = (leadLen) => JSON.stringify({
+      lead: 'L'.repeat(leadLen),
+      lines: [{ n: 1, text: 'A perfectly reasonable line for story one [1].' }],
+    });
+    assert.ok(parseBriefSynthesis(mk(40), 1), '40-char lead must pass');
+    assert.ok(parseBriefSynthesis(mk(700), 1), '700-char lead must pass');
+    assert.equal(parseBriefSynthesis(mk(39), 1), null);
+    assert.equal(parseBriefSynthesis(mk(701), 1), null);
+  });
+
+  it('system prompt pins the exact JSON keys the parser reads', () => {
+    const prompt = synthesisSystemPrompt('2026-07-06');
+    for (const key of ['"lead"', '"lines"', '"n"', '"text"']) {
+      assert.ok(prompt.includes(key), `prompt must name ${key} — parser depends on it`);
+    }
+  });
+
+  it('verifyCitationIndexes catches 3-digit invented markers, leaves 4-digit prose alone', () => {
+    const { text, stripped } = verifyCitationIndexes('Claim [123] and year [2026] and real [1].', 2);
+    assert.equal(stripped, 1, '[123] stripped');
+    assert.match(text, /\[2026\]/, 'bracketed years are prose, not citations');
+    assert.match(text, /\[1\]/);
   });
 });

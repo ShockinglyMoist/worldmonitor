@@ -16,7 +16,7 @@ import {
   briefUserPrompt,
   synthesisSystemPrompt,
   synthesisUserPrompt,
-  parseBriefSynthesis,
+  composeSynthesizedBrief,
 } from './_insights-brief.mjs';
 // Import from the scripts mirror (`scripts/shared/`) — NOT the repo-root
 // `shared/`. Railway services with nixpacks `rootDirectory=scripts` only
@@ -131,6 +131,54 @@ function briefSourceFromStory(story) {
   if (!url || !title || !source) return null;
   const publishedAt = normalizePublishedAt(story?.pubDate);
   return publishedAt ? { title, source, url, publishedAt } : { title, source, url };
+}
+
+/**
+ * #4928: the legacy single-headline brief, extracted intact from the main
+ * flow (L2 of the fallback chain). Corroboration-gated via
+ * pickBriefCluster; enforce/shadow semantics unchanged.
+ */
+async function generateLegacySingleHeadlineBrief(topStories) {
+  const briefCluster = pickBriefCluster(topStories);
+  const topHeadline = briefCluster ? sanitizeTitle(briefCluster.primaryTitle) : '';
+  const worldBriefSources = briefCluster ? [briefSourceFromStory(briefCluster)].filter(Boolean) : [];
+
+  if (!topHeadline) {
+    console.warn('  No multi-source cluster available — publishing degraded (stories without brief)');
+    return { worldBrief: '', briefProvider: '', briefModel: '', worldBriefSources, status: 'degraded' };
+  }
+
+  const llmResult = await callLLM(topHeadline);
+  if (!llmResult) {
+    console.warn('  No LLM available — publishing degraded (stories without brief)');
+    return { worldBrief: '', briefProvider: '', briefModel: '', worldBriefSources, status: 'degraded' };
+  }
+
+  // Hallucination check: did the LLM invent proper nouns not in the
+  // headline? (May 19 incident: "Lebanese President Michel Aoun pledged…"
+  // against a nameless headline. docs/plans/2026-05-19-001 U2.)
+  const validation = validateNoHallucinatedProperNouns(llmResult.text, topHeadline);
+  if (!validation.ok) {
+    const hallucinated = (validation.hallucinated || []).join(' ');
+    if (BRIEF_VALIDATOR_MODE === 'enforce') {
+      console.warn(`  [brief_hallucination ENFORCE] dropped LLM summary: invented "${hallucinated}" not in headline; fell back to headline`);
+      return {
+        worldBrief: topHeadline,
+        briefProvider: `${llmResult.provider}+headline-fallback`,
+        briefModel: llmResult.model,
+        worldBriefSources,
+        status: 'ok',
+      };
+    }
+    console.warn(`  [brief_hallucination SHADOW] would have dropped LLM summary: invented "${hallucinated}" not in headline`);
+  }
+  return {
+    worldBrief: llmResult.text,
+    briefProvider: llmResult.provider,
+    briefModel: llmResult.model,
+    worldBriefSources,
+    status: 'ok',
+  };
 }
 
 async function readDigestFromRedis() {
@@ -438,9 +486,11 @@ async function fetchInsights() {
   // continues to include single-source clusters, rendered as the headline list
   // under the brief. The brief paragraph is the one surface where corroboration
   // matters; the list is already visually marked with per-story sourceCount.
-  const briefCluster = pickBriefCluster(topStories);
-  const topHeadline = briefCluster ? sanitizeTitle(briefCluster.primaryTitle) : '';
-
+  // #4921/#4928: L1 = top-8 synthesis via the pure composer (parse +
+  // corroboration gate + lead noun/anchor gates + per-line enforcement +
+  // citation verification + index-locked sources — all unit-tested in
+  // _insights-brief.mjs). L2 = legacy single-headline brief. Degraded last.
+  // The brief always ships.
   let worldBrief = '';
   let briefProvider = '';
   let briefModel = '';
@@ -448,13 +498,6 @@ async function fetchInsights() {
   let worldBriefSources = [];
   let status = 'ok';
 
-  // ── #4921 L1: top-8 synthesis — a cited lead + one line per story ──────
-  // Grounding contract: parse must succeed, the lead must pass
-  // checkLeadGrounding against ALL top stories, every citation index must
-  // be real (out-of-range markers stripped), and every per-story line must
-  // pass the proper-noun validator against ITS OWN story (enforce: a
-  // failing line degrades to that story's headline, never ships invented
-  // names). Any lead-level failure falls back to L2 (single-headline path).
   const synthesisResult = topStories.length > 0
     ? await callLLM(null, {
         systemPrompt: synthesisSystemPrompt(new Date().toISOString().split('T')[0]),
@@ -462,95 +505,37 @@ async function fetchInsights() {
         maxTokens: 900,
       })
     : null;
-  let synthesized = false;
-  if (synthesisResult) {
-    const parsed = parseBriefSynthesis(synthesisResult.text, topStories.length);
-    const groundingStories = topStories.map(story => ({ headline: story.primaryTitle }));
-    if (parsed && checkLeadGrounding({ lead: parsed.lead }, groundingStories, topStories.length)) {
-      const leadCheck = verifyCitationIndexes(parsed.lead, topStories.length);
-      if (leadCheck.stripped > 0) {
-        console.warn(`  [brief_citation ENFORCE] stripped ${leadCheck.stripped} out-of-range citation(s) from lead`);
-      }
-      const lineByIndex = new Map(parsed.lines.map(line => [line.n, line.text]));
-      let hallucinatedLines = 0;
-      briefStoryLines = topStories.map((story, i) => {
-        const n = i + 1;
-        const headline = sanitizeTitle(story.primaryTitle);
-        const raw = lineByIndex.get(n);
-        if (!raw) return { n, text: headline };
-        // Ground each line against its OWN story: headline + member titles.
-        const groundText = [story.primaryTitle, ...(Array.isArray(story.memberTitles) ? story.memberTitles : [])].join(' — ');
-        const lineCitations = verifyCitationIndexes(raw, topStories.length);
-        const validation = validateNoHallucinatedProperNouns(lineCitations.text, groundText);
-        if (!validation.ok) {
-          hallucinatedLines++;
-          if (BRIEF_VALIDATOR_MODE === 'enforce') return { n, text: headline };
-        }
-        return { n, text: lineCitations.text };
-      });
-      if (hallucinatedLines > 0) {
-        console.warn(`  [brief_hallucination ${BRIEF_VALIDATOR_MODE.toUpperCase()}] ${hallucinatedLines}/${topStories.length} synthesis lines flagged`);
-      }
-      worldBrief = leadCheck.text;
-      briefProvider = synthesisResult.provider;
-      briefModel = synthesisResult.model;
-      worldBriefSources = topStories.map(briefSourceFromStory).filter(Boolean);
-      synthesized = true;
-      console.log(`  Brief synthesized (top-${topStories.length}) via ${briefProvider} (${briefModel})`);
-    } else {
-      console.warn('  [brief_synthesis] parse/grounding failed — falling back to single-headline brief');
+  const composed = synthesisResult
+    ? composeSynthesizedBrief(synthesisResult.text, topStories, {
+        validatorMode: BRIEF_VALIDATOR_MODE,
+        sanitizeTitle,
+        sourceFromStory: briefSourceFromStory,
+      })
+    : null;
+
+  if (composed) {
+    worldBrief = composed.lead;
+    briefStoryLines = composed.lines;
+    worldBriefSources = composed.sources;
+    briefProvider = synthesisResult.provider;
+    briefModel = synthesisResult.model;
+    if (composed.strippedCitations > 0) {
+      console.warn(`  [brief_citation ENFORCE] stripped ${composed.strippedCitations} out-of-range citation(s)`);
     }
-  }
-
-  // ── L2: legacy single-headline brief (corroboration-gated) ─────────────
-  if (!synthesized) {
-  worldBriefSources = briefCluster ? [briefSourceFromStory(briefCluster)].filter(Boolean) : [];
-
-  if (!topHeadline) {
-    status = 'degraded';
-    console.warn('  No multi-source cluster available — publishing degraded (stories without brief)');
+    if (composed.hallucinatedLines > 0) {
+      console.warn(`  [brief_hallucination ${BRIEF_VALIDATOR_MODE.toUpperCase()}] ${composed.hallucinatedLines}/${topStories.length} synthesis lines flagged`);
+    }
+    console.log(`  Brief synthesized (top-${topStories.length}) via ${briefProvider} (${briefModel})`);
   } else {
-    const llmResult = await callLLM(topHeadline);
-    if (llmResult) {
-      // Hallucination check: did the LLM invent proper nouns not in
-      // the headline? The May 19 brief shipped "Lebanese President
-      // Michel Aoun pledged..." against a headline that contained no
-      // name. See docs/plans/2026-05-19-001 U2.
-      const validation = validateNoHallucinatedProperNouns(llmResult.text, topHeadline);
-      if (!validation.ok) {
-        const hallucinated = (validation.hallucinated || []).join(' ');
-        if (BRIEF_VALIDATOR_MODE === 'enforce') {
-          // Replace the LLM summary with the source headline. R1 of the
-          // plan: "falls back to a safe summary (headline-grounded
-          // template) rather than publishing the hallucination."
-          worldBrief = topHeadline;
-          briefProvider = `${llmResult.provider}+headline-fallback`;
-          briefModel = llmResult.model;
-          console.warn(
-            `  [brief_hallucination ENFORCE] dropped LLM summary: invented "${hallucinated}" not in headline; fell back to headline`
-          );
-        } else {
-          // Shadow mode: log but ship the LLM output. The 7-day rollout
-          // window measures the false-positive rate before flipping to
-          // enforce.
-          worldBrief = llmResult.text;
-          briefProvider = llmResult.provider;
-          briefModel = llmResult.model;
-          console.warn(
-            `  [brief_hallucination SHADOW] would have dropped LLM summary: invented "${hallucinated}" not in headline`
-          );
-        }
-      } else {
-        worldBrief = llmResult.text;
-        briefProvider = llmResult.provider;
-        briefModel = llmResult.model;
-        console.log(`  Brief generated via ${briefProvider} (${briefModel})`);
-      }
-    } else {
-      status = 'degraded';
-      console.warn('  No LLM available — publishing degraded (stories without brief)');
+    if (synthesisResult) {
+      console.warn('  [brief_synthesis] composer rejected output (parse/gates) — falling back to single-headline brief');
     }
-  }
+    const legacy = await generateLegacySingleHeadlineBrief(topStories);
+    worldBrief = legacy.worldBrief;
+    briefProvider = legacy.briefProvider;
+    briefModel = legacy.briefModel;
+    worldBriefSources = legacy.worldBriefSources;
+    status = legacy.status;
   }
 
   const multiSourceCount = clusters.filter(c => (c.sources?.length ?? 0) >= 2 || c.entityCorroboration === true).length;

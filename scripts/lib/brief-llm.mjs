@@ -42,8 +42,6 @@ import {
   buildWhyMattersUserPrompt,
   hashBriefStory,
   parseWhyMatters,
-  extractAnchorTokens,
-  groundingTokenSet,
   checkLeadGrounding,
   leadGroundsAgainstStory,
 } from '../../shared/brief-llm-core.js';
@@ -592,7 +590,7 @@ export function validateDigestProseShape(obj, stories) {
   // see — checkLeadGrounding inspects `lead` and `threads[].teaser`,
   // both already trimmed and capped above.
   if (Array.isArray(stories) && stories.length > 0
-      && !checkLeadGrounding({ lead, threads }, stories)) {
+      && !checkLeadGrounding({ lead, threads }, stories, MAX_STORIES_PER_USER)) {
     return null;
   }
 
