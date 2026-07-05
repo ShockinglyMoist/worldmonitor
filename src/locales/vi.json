@@ -1304,7 +1304,8 @@
       "signalTypesEvents": "{{types}} loại tín hiệu • {{events}} sự kiện",
       "newsSignals": "{{news}} tin tức • {{signals}} tín hiệu",
       "provenanceTitle": "Nguồn gốc bài viết: số lượng bài viết được nhập và các nguồn riêng biệt mà bài viết này được chọn từ đó",
-      "compiledFrom": "Được biên soạn từ {{stories}} câu chuyện trên {{sources}} nguồn"
+      "compiledFrom": "Được biên soạn từ {{stories}} câu chuyện trên {{sources}} nguồn",
+      "briefFreshness": "Được tạo {{minutes}}m trước · nguồn mới nhất {{hours}}h tuổi"
     },
     "settings": {
       "exportSettings": "Xuất cài đặt",

@@ -12,6 +12,7 @@ import { getCachedPosture } from '@/services/cached-theater-posture';
 import { isMobileDevice } from '@/utils';
 import { escapeHtml, sanitizeUrl, unsafeRawHtml } from '@/utils/sanitize';
 import { collectBriefSources, normalizeCachedBriefSources, renderBriefSourcesFooter, type BriefSource } from '@/utils/brief-sources';
+import { formatIntelBrief } from '@/utils/format-intel-brief';
 import { SITE_VARIANT } from '@/config';
 import { deletePersistentCache, getPersistentCache, setPersistentCache } from '@/services/persistent-cache';
 import { t } from '@/services/i18n';
@@ -517,7 +518,9 @@ export class InsightsPanel extends Panel {
       insights.worldBriefSources ?? [],
       6,
     );
-    const briefHtml = insights.worldBrief ? this.renderWorldBrief(insights.worldBrief, worldBriefSources) : '';
+    const briefHtml = insights.worldBrief
+      ? this.renderWorldBrief(insights.worldBrief, worldBriefSources, this.renderBriefExtras(insights))
+      : '';
     const focalPointsHtml = this.renderFocalPoints();
     const convergenceHtml = this.renderConvergenceZones();
     const sentimentOverview = this.renderSentimentOverview(sentiments);
@@ -613,7 +616,32 @@ export class InsightsPanel extends Panel {
     `;
   }
 
-  private renderWorldBrief(brief: string, sources: BriefSource[] = []): string {
+  /** #4921: cited per-story lines + staleness footer for the World Brief. */
+  private renderBriefExtras(insights: ServerInsights): string {
+    const lines = Array.isArray(insights.briefStoryLines) ? insights.briefStoryLines : [];
+    const sources = insights.worldBriefSources ?? [];
+    const linesHtml = lines.length > 0
+      ? `<ol class="insights-brief-lines">${lines
+          .map((line) => `<li>${formatIntelBrief(line.text, { sources }).replace(/^<p>|<\/p>$/g, '')}</li>`)
+          .join('')}</ol>`
+      : '';
+    let footer = '';
+    const generatedMs = new Date(insights.generatedAt).getTime();
+    if (Number.isFinite(generatedMs)) {
+      const agoMin = Math.max(0, Math.round((Date.now() - generatedMs) / 60000));
+      const newestMs = insights.sourceAgeRange?.newestMs;
+      const newestAgeH = Number.isFinite(newestMs)
+        ? Math.max(0, Math.round((Date.now() - (newestMs as number)) / 3600000 * 10) / 10)
+        : null;
+      footer = `<div class="insights-brief-freshness">${t('components.insights.briefFreshness', {
+        minutes: String(agoMin),
+        hours: newestAgeH === null ? '?' : String(newestAgeH),
+      })}</div>`;
+    }
+    return linesHtml + footer;
+  }
+
+  private renderWorldBrief(brief: string, sources: BriefSource[] = [], extrasHtml = ''): string {
     const heading =
       SITE_VARIANT === 'tech'      ? `🚀 ${t('components.insights.briefTech')}`
     : SITE_VARIANT === 'commodity' ? `⛏️ ${t('components.insights.briefCommodity')}`
@@ -623,6 +651,7 @@ export class InsightsPanel extends Panel {
       <div class="insights-brief">
         <div class="insights-section-title">${heading}</div>
         <div class="insights-brief-text">${escapeHtml(brief)}</div>
+        ${extrasHtml}
         ${renderBriefSourcesFooter(sources, { className: 'insights-brief-sources' })}
       </div>
     `;

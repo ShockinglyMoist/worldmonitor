@@ -8,6 +8,7 @@ import type {
 import { cachedFetchJson, getCachedJson } from '../../../_shared/redis';
 import { UPSTREAM_TIMEOUT_MS, TIER1_COUNTRIES, sha256Hex } from './_shared';
 import { callLlm } from '../../../_shared/llm';
+import { verifyCitationIndexes, checkLeadGrounding } from '../../../../shared/brief-llm-core.js';
 import { isCallerPremium } from '../../../_shared/premium-check';
 import { sanitizeForPrompt } from '../../../_shared/llm-sanitize.js';
 import { ENERGY_SPINE_KEY_PREFIX } from '../../../_shared/cache-keys';
@@ -239,10 +240,33 @@ Rules:
 
       if (!llmResult) return null;
 
+      // #4921 brief contract: citations are verified mechanically — every
+      // [n] must map to a real grounding source; invented indexes are
+      // stripped before shipping (ENFORCE). The prompt demands "do not
+      // invent source numbers", but demands are not guarantees.
+      const citationCheck = verifyCitationIndexes(llmResult.content, entrySources.length);
+      if (citationCheck.stripped > 0) {
+        console.warn(
+          `[country-intel] stripped ${citationCheck.stripped} out-of-range citation(s) ` +
+            `for ${req.countryCode} (sources=${entrySources.length})`,
+        );
+      }
+      // Grounding telemetry (measure-only for now — the analyst format
+      // legitimately synthesizes across sources, so enforce here needs its
+      // own false-positive window first; see #4921).
+      const grounded = checkLeadGrounding(
+        { lead: citationCheck.text.slice(0, 600) },
+        entrySources.map((source) => ({ headline: source.title })),
+        entrySources.length || 1,
+      );
+      if (!grounded) {
+        console.warn(`[country-intel] GROUNDING MEASURE: brief for ${req.countryCode} names no source anchor`);
+      }
+
       return {
         countryCode: req.countryCode,
         countryName,
-        brief: llmResult.content,
+        brief: citationCheck.text,
         model: llmResult.model,
         generatedAt: Date.now(),
         sources: entrySources,

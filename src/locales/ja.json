@@ -1304,7 +1304,8 @@
       "signalTypesEvents": "{{types}} シグナルタイプ • {{events}} イベント",
       "newsSignals": "{{news}} ニュース • {{signals}} シグナル",
       "provenanceTitle": "カバレッジプロヴェナンス: このブリーフが選択された取り込まれたストーリーと個別ソースの数",
-      "compiledFrom": "{{stories}}件のストーリーから{{sources}}個のソースをコンパイル"
+      "compiledFrom": "{{stories}}件のストーリーから{{sources}}個のソースをコンパイル",
+      "briefFreshness": "{{minutes}}m前に生成 · 最新ソース{{hours}}h前"
     },
     "settings": {
       "exportSettings": "設定をエクスポート",

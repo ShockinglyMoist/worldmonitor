@@ -10,7 +10,14 @@ import {
 } from './_clustering.mjs';
 import { extractCountryCode } from './shared/geo-extract.mjs';
 import { unwrapEnvelope } from './_seed-envelope-source.mjs';
-import { pickBriefCluster, briefSystemPrompt, briefUserPrompt } from './_insights-brief.mjs';
+import {
+  pickBriefCluster,
+  briefSystemPrompt,
+  briefUserPrompt,
+  synthesisSystemPrompt,
+  synthesisUserPrompt,
+  parseBriefSynthesis,
+} from './_insights-brief.mjs';
 // Import from the scripts mirror (`scripts/shared/`) — NOT the repo-root
 // `shared/`. Railway services with nixpacks `rootDirectory=scripts` only
 // package files under scripts/; a `../shared/` import resolves to
@@ -18,15 +25,22 @@ import { pickBriefCluster, briefSystemPrompt, briefUserPrompt } from './_insight
 // the seeder on startup. The local pattern is the `./shared/geo-extract.mjs`
 // line above. PR #3836 review caught this. See skill
 // railway-deploy-gotchas/reference/nixpacks-root-dir-scripts-cross-dir-import-escape.
-import { validateNoHallucinatedProperNouns } from './shared/brief-llm-core.js';
+import {
+  validateNoHallucinatedProperNouns,
+  checkLeadGrounding,
+  verifyCitationIndexes,
+} from './shared/brief-llm-core.js';
 
 // Hallucination validator rollout mode (PR-2 of brief-content-quality
 // regressions). `shadow` = log violations to Sentry but ship the LLM
 // output unchanged (default, safe). `enforce` = on violation, replace
 // the LLM summary with the source headline. Flip via Railway env after
 // the 7-day shadow window confirms <5% violation rate.
+// #4921: enforce is the DEFAULT — the shadow window measured its
+// false-positive rate; shipping detected hallucinations was the residual
+// risk. Set BRIEF_VALIDATOR_MODE=shadow to revert during an incident.
 const BRIEF_VALIDATOR_MODE =
-  process.env.BRIEF_VALIDATOR_MODE === 'enforce' ? 'enforce' : 'shadow';
+  process.env.BRIEF_VALIDATOR_MODE === 'shadow' ? 'shadow' : 'enforce';
 
 // True only when run directly as a cron entry (node seed-insights.mjs), false
 // when imported by tests — so importing the module doesn't load .env or fire a
@@ -192,8 +206,13 @@ function __setInsightsLlmTransportForTests(overrides = null) {
 }
 
 async function callLLM(headline, options = {}) {
-  const systemPrompt = briefSystemPrompt(new Date().toISOString().split('T')[0]);
-  const userPrompt = briefUserPrompt(headline);
+  // #4921: callers may supply explicit prompts (the top-8 synthesis call);
+  // the headline default keeps the legacy single-headline path and its
+  // retry tests unchanged.
+  const systemPrompt = options.systemPrompt
+    ?? briefSystemPrompt(new Date().toISOString().split('T')[0]);
+  const userPrompt = options.userPrompt ?? briefUserPrompt(headline);
+  const maxTokens = Number.isFinite(options.maxTokens) ? options.maxTokens : 300;
 
   const insightsFetch = insightsLlmFetchForTests || ((...args) => globalThis.fetch(...args));
   const callBudgetMs = Number.isFinite(options.callBudgetMs)
@@ -225,7 +244,7 @@ async function callLLM(headline, options = {}) {
               { role: 'system', content: systemPrompt },
               { role: 'user', content: userPrompt },
             ],
-            max_tokens: 300,
+            max_tokens: maxTokens,
             temperature: 0.1,
             ...provider.extraBody,
           }),
@@ -421,12 +440,71 @@ async function fetchInsights() {
   // matters; the list is already visually marked with per-story sourceCount.
   const briefCluster = pickBriefCluster(topStories);
   const topHeadline = briefCluster ? sanitizeTitle(briefCluster.primaryTitle) : '';
-  const worldBriefSources = briefCluster ? [briefSourceFromStory(briefCluster)].filter(Boolean) : [];
 
   let worldBrief = '';
   let briefProvider = '';
   let briefModel = '';
+  let briefStoryLines = [];
+  let worldBriefSources = [];
   let status = 'ok';
+
+  // ── #4921 L1: top-8 synthesis — a cited lead + one line per story ──────
+  // Grounding contract: parse must succeed, the lead must pass
+  // checkLeadGrounding against ALL top stories, every citation index must
+  // be real (out-of-range markers stripped), and every per-story line must
+  // pass the proper-noun validator against ITS OWN story (enforce: a
+  // failing line degrades to that story's headline, never ships invented
+  // names). Any lead-level failure falls back to L2 (single-headline path).
+  const synthesisResult = topStories.length > 0
+    ? await callLLM(null, {
+        systemPrompt: synthesisSystemPrompt(new Date().toISOString().split('T')[0]),
+        userPrompt: synthesisUserPrompt(topStories),
+        maxTokens: 900,
+      })
+    : null;
+  let synthesized = false;
+  if (synthesisResult) {
+    const parsed = parseBriefSynthesis(synthesisResult.text, topStories.length);
+    const groundingStories = topStories.map(story => ({ headline: story.primaryTitle }));
+    if (parsed && checkLeadGrounding({ lead: parsed.lead }, groundingStories, topStories.length)) {
+      const leadCheck = verifyCitationIndexes(parsed.lead, topStories.length);
+      if (leadCheck.stripped > 0) {
+        console.warn(`  [brief_citation ENFORCE] stripped ${leadCheck.stripped} out-of-range citation(s) from lead`);
+      }
+      const lineByIndex = new Map(parsed.lines.map(line => [line.n, line.text]));
+      let hallucinatedLines = 0;
+      briefStoryLines = topStories.map((story, i) => {
+        const n = i + 1;
+        const headline = sanitizeTitle(story.primaryTitle);
+        const raw = lineByIndex.get(n);
+        if (!raw) return { n, text: headline };
+        // Ground each line against its OWN story: headline + member titles.
+        const groundText = [story.primaryTitle, ...(Array.isArray(story.memberTitles) ? story.memberTitles : [])].join(' — ');
+        const lineCitations = verifyCitationIndexes(raw, topStories.length);
+        const validation = validateNoHallucinatedProperNouns(lineCitations.text, groundText);
+        if (!validation.ok) {
+          hallucinatedLines++;
+          if (BRIEF_VALIDATOR_MODE === 'enforce') return { n, text: headline };
+        }
+        return { n, text: lineCitations.text };
+      });
+      if (hallucinatedLines > 0) {
+        console.warn(`  [brief_hallucination ${BRIEF_VALIDATOR_MODE.toUpperCase()}] ${hallucinatedLines}/${topStories.length} synthesis lines flagged`);
+      }
+      worldBrief = leadCheck.text;
+      briefProvider = synthesisResult.provider;
+      briefModel = synthesisResult.model;
+      worldBriefSources = topStories.map(briefSourceFromStory).filter(Boolean);
+      synthesized = true;
+      console.log(`  Brief synthesized (top-${topStories.length}) via ${briefProvider} (${briefModel})`);
+    } else {
+      console.warn('  [brief_synthesis] parse/grounding failed — falling back to single-headline brief');
+    }
+  }
+
+  // ── L2: legacy single-headline brief (corroboration-gated) ─────────────
+  if (!synthesized) {
+  worldBriefSources = briefCluster ? [briefSourceFromStory(briefCluster)].filter(Boolean) : [];
 
   if (!topHeadline) {
     status = 'degraded';
@@ -472,6 +550,7 @@ async function fetchInsights() {
       status = 'degraded';
       console.warn('  No LLM available — publishing degraded (stories without brief)');
     }
+  }
   }
 
   const multiSourceCount = clusters.filter(c => (c.sources?.length ?? 0) >= 2 || c.entityCorroboration === true).length;
@@ -526,8 +605,19 @@ async function fetchInsights() {
       `drops adm=${provenance.selectionDrops.admissibility} srcCap=${provenance.selectionDrops.sourceCap} overflow=${provenance.selectionDrops.overflow}`,
   );
 
+  // #4921 staleness footer: the age window of the material this brief was
+  // built from, computed server-side (the client only sees topStories).
+  const pubTimes = normalizedItems
+    .map(item => new Date(item.pubDate).getTime())
+    .filter(Number.isFinite);
+  const sourceAgeRange = pubTimes.length > 0
+    ? { newestMs: Math.max(...pubTimes), oldestMs: Math.min(...pubTimes) }
+    : null;
+
   const payload = {
     worldBrief,
+    briefStoryLines,
+    sourceAgeRange,
     worldBriefSources,
     briefProvider,
     briefModel,

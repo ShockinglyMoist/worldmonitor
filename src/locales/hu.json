@@ -1444,7 +1444,8 @@
       "signalTypesEvents": "{{types}} szignáltípus • {{events}} esemény",
       "newsSignals": "{{news}} hír • {{signals}} szignál",
       "provenanceTitle": "Lefedettség eredete: hány feldolgozott történetből és különálló forrásból választotta ki ezt az összefoglalót",
-      "compiledFrom": "{{stories}} történetből és {{sources}} forrásból összeállítva"
+      "compiledFrom": "{{stories}} történetből és {{sources}} forrásból összeállítva",
+      "briefFreshness": "Generálva {{minutes}}m idővel ezelőtt · legfrissebb forrás {{hours}}ó régi"
     },
     "settings": {
       "exportSettings": "Beállítások exportálása",

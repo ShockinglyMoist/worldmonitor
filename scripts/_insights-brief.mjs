@@ -43,3 +43,75 @@ Rules:
 export function briefUserPrompt(headline) {
   return `Headline: ${headline}\n\nRewrite as 2 sentences using only facts from this headline.`;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4921 — top-8 synthesis. The World Brief previously narrated ONE headline;
+// these builders produce a genuine synthesis: a cited lead plus one line per
+// top story, in a single structured LLM call.
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function synthesisSystemPrompt(dateISO) {
+  return `Current date: ${dateISO}.
+
+You are compiling the WORLD BRIEF from the numbered stories below. Respond with JSON ONLY (no markdown fences, no commentary):
+{"lead": "...", "lines": [{"n": 1, "text": "..."}, ...]}
+
+Rules:
+- "lead": 2-3 sentences, under 80 words, synthesizing the most consequential 2-3 threads. Cite every claim with the bracket number of its story, e.g. [1] or [3].
+- "lines": exactly one entry per numbered story, in order. Each "text" is ONE sentence under 30 words restating that story, ending with its citation [n].
+- Use ONLY facts present in the numbered story text. Do not add names, places, dates, numbers, or context that are not explicitly there.
+- Do not invent proper nouns (people, organizations, countries) that are not in the story text.
+- Never merge facts from different stories into one claim; the lead may JUXTAPOSE stories but each claim keeps its own [n].
+- NEVER start with "Breaking news", "Good evening", "Tonight", or TV-style openings.`;
+}
+
+export function synthesisUserPrompt(stories) {
+  const lines = stories.map((story, i) => {
+    const sources = Array.isArray(story.sources) && story.sources.length > 0
+      ? story.sources.length
+      : (story.sourceCount ?? 1);
+    return `${i + 1}. ${story.primaryTitle} (${story.primarySource}, ${sources} source${sources === 1 ? '' : 's'})`;
+  });
+  return `Stories:\n${lines.join('\n')}\n\nCompile the world brief JSON.`;
+}
+
+/**
+ * Tolerant parser for the synthesis JSON. Strips code fences (groq and
+ * Gemini both wrap), extracts the outermost object, validates shape.
+ * Returns { lead, lines: [{ n, text }] } or null — callers fall back to
+ * the single-headline path on null (the brief always ships).
+ */
+export function parseBriefSynthesis(rawText, storyCount) {
+  if (typeof rawText !== 'string' || rawText.length === 0) return null;
+  let text = rawText.replace(/```(?:json)?/gi, '').trim();
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start === -1 || end <= start) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  const lead = typeof parsed?.lead === 'string' ? parsed.lead.trim() : '';
+  if (lead.length < 40 || lead.length > 700) return null;
+  const rawLines = Array.isArray(parsed?.lines) ? parsed.lines : [];
+  const byIndex = new Map();
+  for (const entry of rawLines) {
+    const n = Number(entry?.n);
+    const lineText = typeof entry?.text === 'string' ? entry.text.trim() : '';
+    if (!Number.isInteger(n) || n < 1 || n > storyCount) continue;
+    if (lineText.length < 15 || lineText.length > 260) continue;
+    if (!byIndex.has(n)) byIndex.set(n, lineText);
+  }
+  // Require at least half the stories to have usable lines — below that
+  // the model ignored the contract and the single-headline fallback is
+  // more trustworthy. Missing lines are filled from headlines upstream.
+  if (byIndex.size < Math.ceil(storyCount / 2)) return null;
+  return {
+    lead,
+    lines: Array.from(byIndex.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([n, lineText]) => ({ n, text: lineText })),
+  };
+}
