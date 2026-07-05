@@ -64,6 +64,12 @@ export interface YieldCurveContext {
   rate30y: number;
 }
 
+/** #4922 (c): recent earnings surprises + upcoming density for the brief. */
+export interface EarningsBriefContext {
+  recent: Array<{ symbol: string; direction: 'beat' | 'miss' }>;
+  upcomingCount: number;
+}
+
 export interface SectorBriefContext {
   topName: string;
   topChange: number;
@@ -82,6 +88,7 @@ export interface BuildDailyMarketBriefOptions {
   regimeContext?: RegimeMacroContext;
   yieldCurveContext?: YieldCurveContext;
   sectorContext?: SectorBriefContext;
+  earningsContext?: EarningsBriefContext;
   frameworkAppend?: string;
   newsCategories?: string[];
   /** Override the per-call summarizer budget. Defaults to
@@ -357,6 +364,7 @@ function buildExtendedMarketContext(
   regime?: RegimeMacroContext,
   yieldCurve?: YieldCurveContext,
   sector?: SectorBriefContext,
+  earnings?: EarningsBriefContext,
 ): string {
   const parts: string[] = [`Markets: ${baseContext}`];
 
@@ -391,6 +399,23 @@ function buildExtendedMarketContext(
       `Sectors: ${sector.countPositive}/${sector.total} positive`,
       `Top: ${sector.topName} ${topSign}${topQ.toFixed(1)}%  Worst: ${sector.worstName} ${worstSign}${worstQ.toFixed(1)}%`,
     ].join('\n'));
+  }
+
+  // #4922 (c): earnings finally reach the brief. Symbols + direction only —
+  // stable per reporting date, so the summary cache identity (#4914) does
+  // not churn intraday.
+  if (earnings && (earnings.recent.length > 0 || earnings.upcomingCount > 0)) {
+    const lines: string[] = [];
+    if (earnings.recent.length > 0) {
+      lines.push(`Earnings: ${earnings.recent
+        .slice(0, 5)
+        .map((entry) => `${entry.symbol} ${entry.direction}`)
+        .join(', ')}`);
+    }
+    if (earnings.upcomingCount > 0) {
+      lines.push(`Upcoming earnings (14d): ${earnings.upcomingCount}`);
+    }
+    parts.push(lines.join('\n'));
   }
 
   return parts.join('\n\n');
@@ -469,7 +494,7 @@ export async function buildDailyMarketBrief(options: BuildDailyMarketBriefOption
   }
 
   const { headlines: summaryHeadlines, marketContext } = buildSummaryInputs(items, relevantHeadlines);
-  let extendedContext = buildExtendedMarketContext(marketContext, options.regimeContext, options.yieldCurveContext, options.sectorContext);
+  let extendedContext = buildExtendedMarketContext(marketContext, options.regimeContext, options.yieldCurveContext, options.sectorContext, options.earningsContext);
   if (options.frameworkAppend) {
     extendedContext = `${extendedContext}\n\n---\nAnalytical Framework:\n${options.frameworkAppend}`;
   }

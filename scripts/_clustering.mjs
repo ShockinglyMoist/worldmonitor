@@ -187,7 +187,16 @@ function hasStrongNonKeywordSignal(cluster) {
   return isLlmThreatSource(cluster.threat?.source) && (level === 'high' || level === 'critical');
 }
 
-export function scoreImportance(cluster) {
+/**
+ * @param {object} cluster
+ * @param {{ demoteFinance?: boolean }} [opts] #4922 (f): the ×0.35 finance
+ *   demotion is correct for the geopolitical World Brief but backwards for
+ *   a finance-focused ranking surface. Pass demoteFinance:false to rank
+ *   finance neutrally. NOTE: the only live consumer today (seed-insights)
+ *   runs the full variant and keeps the default — this parameter is the
+ *   seam a finance-variant insights run plugs into (tracked in #4922).
+ */
+export function scoreImportance(cluster, opts = {}) {
   let score = 0;
   const titleLower = normalizedMatchText(cluster.primaryTitle);
   const upstream = finiteNumber(cluster.upstreamImportanceScore, 0);
@@ -228,7 +237,8 @@ export function scoreImportance(cluster) {
   if (crisisN > 0) score += 15 + crisisN * 5;
 
   const demoteN = countMatches(titleLower, DEMOTE_KEYWORDS);
-  if (demoteN > 0 && !cluster.entityCorroboration && !hasStrongNonKeywordSignal(cluster)) score *= 0.35;
+  const demoteFinance = opts.demoteFinance !== false;
+  if (demoteFinance && demoteN > 0 && !cluster.entityCorroboration && !hasStrongNonKeywordSignal(cluster)) score *= 0.35;
 
   return score;
 }
@@ -311,13 +321,13 @@ export function computeEntityCorroboration(clusters, nowMs = Date.now()) {
  *   #4920 coverage ledger: when provided, populated with how many clusters
  *   each gate dropped — previously all three gates were silent.
  */
-export function selectTopStories(clusters, maxCount = 8, stats) {
+export function selectTopStories(clusters, maxCount = 8, stats, opts = {}) {
   const nowMs = Date.now();
   computeEntityCorroboration(clusters, nowMs);
   const admissible = [];
   let admissibilityDropped = 0;
   for (const c of clusters) {
-    const score = scoreImportance(c);
+    const score = scoreImportance(c, opts);
     if (isTopStoriesAdmissible(c, score)) {
       admissible.push({ cluster: c, score, effectiveScore: score * recencyWeight(c, nowMs) });
     } else {
