@@ -146,6 +146,11 @@ describe('server catalog extraction (#4920a)', () => {
     assert.match(wrapper.url, /^https:\/\/news\.google\.com\/rss\/search\?q=.+&hl=/);
     assert.ok(feeds.every((f) => f.catalog === 'server'));
   });
+
+  it('extracts double-quoted names (Tom\'s Hardware class — #4927 cross-model)', () => {
+    const feeds = extractServerFeeds();
+    assert.ok(feeds.some((f) => f.name === "Tom's Hardware"), 'double-quoted names must not be skipped');
+  });
 });
 
 describe('coverage-ledger and provenance wiring (source-textual)', () => {
@@ -182,3 +187,95 @@ describe('coverage-ledger and provenance wiring (source-textual)', () => {
     assert.match(wf, /seed-recall-benchmark\.mjs/);
   });
 });
+
+// ── #4927 review-round additions ───────────────────────────────────────────
+
+import { unwrapEnvelope, gdeltUrl } from '../scripts/seed-recall-benchmark.mjs';
+import { publishFeedHealth } from '../scripts/validate-rss-feeds.mjs';
+import { getOptionalUpstashCreds } from '../scripts/_upstash-rest.mjs';
+
+describe('gn()/gnLocale() replica drift guard (#4927 review)', () => {
+  it('extractServerFeeds URL builders textually match the _feeds.ts source', () => {
+    const feedsSrc = readSrc('server/worldmonitor/news/v1/_feeds.ts');
+    const validatorSrc = readSrc('scripts/validate-rss-feeds.mjs');
+    // The load-bearing template expressions must appear byte-identical in
+    // both files — a change to gn()'s URL shape in _feeds.ts without the
+    // replica following makes the health report validate URLs the digest
+    // never fetches.
+    const gnTemplate = 'https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-US&gl=US&ceid=US:en';
+    const gnLocaleTemplate = 'https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=${hl}&gl=${gl}&ceid=${ceid}';
+    for (const template of [gnTemplate, gnLocaleTemplate]) {
+      assert.ok(feedsSrc.includes(template), `_feeds.ts must contain: ${template}`);
+      assert.ok(validatorSrc.includes(template), `validate-rss-feeds replica must contain: ${template}`);
+    }
+  });
+});
+
+describe('selectTopStories overflow stat (#4927 review)', () => {
+  it('counts admissible clusters that never fit under maxCount', () => {
+    const clusters = Array.from({ length: 12 }, (_, i) => ({
+      primaryTitle: `Distinct breaking story number ${i} about topic ${i}`,
+      primarySource: `Source${i}`,
+      primaryLink: `https://x/${i}`,
+      pubDate: new Date().toISOString(),
+      sources: [`Source${i}`, `Other${i}`],
+      isAlert: true,
+      tier: 1,
+    }));
+    const stats = {};
+    const selected = selectTopStories(clusters, 8, stats);
+    assert.equal(selected.length, 8);
+    assert.equal(stats.overflowDropped, 4, '12 admissible distinct-source clusters, 8 slots → 4 overflow');
+    assert.equal(stats.sourceCapDropped, 0);
+  });
+});
+
+describe('publisher orchestration seams (#4927 review)', () => {
+  it('publishFeedHealth skips cleanly without credentials', async () => {
+    const prevUrl = process.env.UPSTASH_REDIS_REST_URL;
+    const prevToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    try {
+      const out = await publishFeedHealth([{ name: 'X', url: 'https://x/rss', status: 'OK' }]);
+      assert.deepEqual(out, { published: false, reason: 'no-creds' });
+      assert.equal(getOptionalUpstashCreds(), null);
+    } finally {
+      if (prevUrl !== undefined) process.env.UPSTASH_REDIS_REST_URL = prevUrl;
+      if (prevToken !== undefined) process.env.UPSTASH_REDIS_REST_TOKEN = prevToken;
+    }
+  });
+
+  it('gdeltUrl builds a bounded, English, 24h ArtList query', () => {
+    const url = gdeltUrl('(economy OR markets)');
+    assert.match(url, /^https:\/\/api\.gdeltproject\.org\/api\/v2\/doc\/doc\?/);
+    assert.match(url, /sourcelang%3Aeng/);
+    assert.match(url, /maxrecords=25/);
+    assert.match(url, /timespan=24h/);
+  });
+
+  it('unwrapEnvelope tolerates enveloped and bare payloads', () => {
+    assert.deepEqual(unwrapEnvelope({ data: { a: 1 }, fetchedAt: 5 }), { a: 1 });
+    assert.deepEqual(unwrapEnvelope({ categories: {} }), { categories: {} });
+    assert.equal(unwrapEnvelope(null), null);
+  });
+});
+
+describe('locale integrity for provenance keys (#4927 review)', () => {
+  it('every parity-tested locale carries compiledFrom with double-brace tokens', () => {
+    const fs = readdirSyncLocales();
+    for (const file of fs) {
+      const d = JSON.parse(readSrc(`src/locales/${file}`));
+      const val = d?.components?.insights?.compiledFrom;
+      assert.ok(typeof val === 'string' && val.length > 0, `${file} missing compiledFrom`);
+      assert.ok(val.includes('{{stories}}') && val.includes('{{sources}}'),
+        `${file} compiledFrom must keep {{stories}}/{{sources}} tokens, got: ${val}`);
+    }
+  });
+});
+
+import { readdirSync } from 'node:fs';
+function readdirSyncLocales() {
+  return readdirSync(resolve(root, 'src/locales'))
+    .filter((f) => f.endsWith('.json') && f !== 'en.shell.json');
+}

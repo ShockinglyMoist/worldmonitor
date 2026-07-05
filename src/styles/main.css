@@ -17948,6 +17948,15 @@ a.prediction-link:hover {
   flex: 1;
 }
 
+/* #4920 coverage provenance stamp under the insights stats */
+.insights-provenance {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin: -6px 0 12px;
+  padding: 0 8px;
+  text-align: right;
+}
+
 .insight-stat-value {
   display: block;
   font-size: 18px;

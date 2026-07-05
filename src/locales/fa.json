@@ -1442,7 +1442,9 @@
       "tonePositive": "Positive",
       "overall": "Overall: {{tone}}",
       "signalTypesEvents": "{{types}} signal types • {{events}} events",
-      "newsSignals": "{{news}} news • {{signals}} signals"
+      "newsSignals": "{{news}} news • {{signals}} signals",
+      "compiledFrom": "گردآوری‌شده از {{stories}} خبر از {{sources}} منبع",
+      "provenanceTitle": "شفافیت پوشش: این گزیده از چه تعداد خبر دریافتی و چند منبع مجزا انتخاب شده است"
     },
     "settings": {
       "exportSettings": "Export Settings",

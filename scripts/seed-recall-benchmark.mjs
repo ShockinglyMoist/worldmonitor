@@ -22,6 +22,8 @@
 
 import { fetchGdeltJson } from './_gdelt-fetch.mjs';
 import { computeRecall } from './_recall-benchmark-core.mjs';
+import { pathToFileURL } from 'node:url';
+import { getOptionalUpstashCreds, upstashCommand } from './_upstash-rest.mjs';
 
 const RECALL_KEY = 'news:recall-benchmark:v1';
 const META_KEY = 'seed-meta:news:recall-benchmark';
@@ -38,7 +40,7 @@ const REFERENCE_QUERIES = [
   { label: 'diplomacy', q: '(summit OR sanctions OR treaty OR election)' },
 ];
 
-function gdeltUrl(query) {
+export function gdeltUrl(query) {
   const params = new URLSearchParams({
     query: `${query} sourcelang:eng`,
     mode: 'ArtList',
@@ -50,18 +52,7 @@ function gdeltUrl(query) {
   return `https://api.gdeltproject.org/api/v2/doc/doc?${params.toString()}`;
 }
 
-async function redisCommand(restUrl, token, command) {
-  const resp = await fetch(restUrl, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(command),
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!resp.ok) throw new Error(`Upstash HTTP ${resp.status}`);
-  return resp.json();
-}
-
-function unwrapEnvelope(parsed) {
+export function unwrapEnvelope(parsed) {
   // Canonical keys may be stored as { data, fetchedAt, ... } envelopes or
   // bare payloads — same tolerance as scripts/seed-insights.mjs.
   if (parsed && typeof parsed === 'object' && parsed.data && typeof parsed.data === 'object') {
@@ -71,15 +62,14 @@ function unwrapEnvelope(parsed) {
 }
 
 async function main() {
-  const restUrl = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!restUrl || !token) {
+  const creds = getOptionalUpstashCreds();
+  if (!creds) {
     console.log('recall-benchmark skipped (no UPSTASH_REDIS_REST_URL/TOKEN in env)');
     return;
   }
 
   // 1. Digest titles — what we actually ingested.
-  const got = await redisCommand(restUrl, token, ['GET', DIGEST_KEY]);
+  const got = await upstashCommand(creds, ['GET', DIGEST_KEY]);
   if (typeof got?.result !== 'string' || got.result.length === 0) {
     console.warn(`WARN: ${DIGEST_KEY} missing/empty — cannot benchmark, skipping`);
     return;
@@ -138,10 +128,17 @@ async function main() {
     total: result.total,
     digestTitleCount: digestTitles.length,
     threshold: result.threshold,
-    missed: result.missed,
+    // Untrusted external titles: clamp length so a hostile/broken GDELT
+    // response cannot balloon the published payload.
+    missed: result.missed.map((m) => ({
+      ...m,
+      title: String(m.title).slice(0, 200),
+      // Only http(s) URLs, clamped — GDELT fields are untrusted input.
+      url: typeof m.url === 'string' && /^https?:\/\//.test(m.url) ? m.url.slice(0, 300) : undefined,
+    })),
   };
-  await redisCommand(restUrl, token, ['SET', RECALL_KEY, JSON.stringify(payload), 'EX', String(3 * 86400)]);
-  await redisCommand(restUrl, token, ['SET', META_KEY, JSON.stringify({
+  await upstashCommand(creds, ['SET', RECALL_KEY, JSON.stringify(payload), 'EX', String(3 * 86400)]);
+  await upstashCommand(creds, ['SET', META_KEY, JSON.stringify({
     fetchedAt: payload.checkedAt,
     recordCount: result.total,
     sourceVersion: 'recall-benchmark-v1',
@@ -149,7 +146,10 @@ async function main() {
   console.log(`published ${RECALL_KEY}`);
 }
 
-main().catch((err) => {
-  // Analysis job: never redden the workflow on upstream jitter.
-  console.warn(`recall-benchmark failed (non-fatal): ${err.message}`);
-});
+// Importable for tests; only run when executed directly.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    // Analysis job: never redden the workflow on upstream jitter.
+    console.warn(`recall-benchmark failed (non-fatal): ${err.message}`);
+  });
+}

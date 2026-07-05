@@ -1303,7 +1303,7 @@
       "overall": "Genel: {{tone}}",
       "signalTypesEvents": "{{types}} sinyal türü • {{events}} olay",
       "newsSignals": "{{news}} haber • {{signals}} sinyal",
-      "compiledFrom": "{stories} hikaye ve {sources} kaynaktan derlenmiştir",
+      "compiledFrom": "{{stories}} hikaye ve {{sources}} kaynaktan derlenmiştir",
       "provenanceTitle": "Kapsam kaynağı: bu özet için kaç alınan hikaye ve farklı kaynaktan seçildiği"
     },
     "settings": {

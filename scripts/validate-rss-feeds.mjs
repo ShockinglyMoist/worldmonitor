@@ -127,14 +127,15 @@ export function extractServerFeeds() {
 
   const feeds = [];
   const seen = new Set();
-  const entryRe = /name:\s*'((?:[^'\\]|\\.)*)'\s*,\s*url:\s*(?:'([^']+)'|gn\(\s*'((?:[^'\\]|\\.)*)'\s*\)|gnLocale\(\s*'((?:[^'\\]|\\.)*)'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*\))/g;
+  // Names may be single- OR double-quoted ("Tom's Hardware").
+  const entryRe = /name:\s*(?:'((?:[^'\\]|\\.)*)'|"([^"]+)")\s*,\s*url:\s*(?:'([^']+)'|gn\(\s*'((?:[^'\\]|\\.)*)'\s*\)|gnLocale\(\s*'((?:[^'\\]|\\.)*)'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*\))/g;
   let m;
   while ((m = entryRe.exec(src)) !== null) {
-    const name = m[1].replace(/\\'/g, "'");
+    const name = (m[1] ?? m[2]).replace(/\\'/g, "'");
     let url;
-    if (m[2]) url = m[2];
-    else if (m[3] !== undefined) url = gn(m[3].replace(/\\'/g, "'"));
-    else url = gnLocale(m[4].replace(/\\'/g, "'"), m[5], m[6], m[7]);
+    if (m[3]) url = m[3];
+    else if (m[4] !== undefined) url = gn(m[4].replace(/\\'/g, "'"));
+    else url = gnLocale(m[5].replace(/\\'/g, "'"), m[6], m[7], m[8]);
     if (!seen.has(url)) {
       seen.add(url);
       feeds.push({ name, url, catalog: 'server' });
@@ -407,25 +408,15 @@ async function main() {
   }
 }
 
-async function publishFeedHealth(results) {
-  const restUrl = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!restUrl || !token) {
+export async function publishFeedHealth(results) {
+  const { getOptionalUpstashCreds, upstashCommand } = await import('./_upstash-rest.mjs');
+  const creds = getOptionalUpstashCreds();
+  if (!creds) {
     console.log('feed-health publish skipped (no UPSTASH_REDIS_REST_URL/TOKEN in env)');
-    return;
+    return { published: false, reason: 'no-creds' };
   }
   const { buildFeedHealthPayload } = await import('./_feed-health.mjs');
-
-  const redis = async (command) => {
-    const resp = await fetch(restUrl, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(command),
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!resp.ok) throw new Error(`Upstash HTTP ${resp.status}`);
-    return resp.json();
-  };
+  const redis = (command) => upstashCommand(creds, command);
 
   let previous = null;
   try {
@@ -448,10 +439,14 @@ async function publishFeedHealth(results) {
     }
   }
   console.log(`feed-health published: ${payload.summary.ok}/${payload.feedCount} OK, ${payload.silentZeros.length} silent zeros`);
+  return { published: true, payload };
 }
 
 // Importable for tests (#4920): only run when executed directly.
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+// pathToFileURL handles Windows drive letters and percent-encoding that a
+// hand-built file:// string gets wrong.
+const { pathToFileURL } = await import('node:url');
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(err => {
     console.error('Fatal:', err);
     process.exit(2);
