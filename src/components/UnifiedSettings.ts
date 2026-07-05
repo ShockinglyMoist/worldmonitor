@@ -1113,7 +1113,7 @@ export class UnifiedSettings {
           : p.DODO_PRODUCTS.PRO_MONTHLY;
         return m.startCheckout(product);
       })).catch(() => {
-        window.open('https://worldmonitor.app/pro', '_blank');
+        window.open('https://worldmonitor.app/pro', '_blank', 'noopener,noreferrer');
       });
       return;
     }
