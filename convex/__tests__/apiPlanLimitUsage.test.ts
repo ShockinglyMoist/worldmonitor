@@ -404,6 +404,105 @@ describe("api plan-limit usage scanner", () => {
     expect(stillCurrent).toHaveLength(0);
   });
 
+  test("does not notify a Pro (no apiAccess) account on an api_* dimension", async () => {
+    const t = convexTest(schema, modules);
+    await seedEntitlement(t, "user-pro", "pro_monthly");
+
+    // Pro has apiAccess:false and apiBurstRequestsPerMinute:0. Its ordinary
+    // Clerk-session dashboard traffic can still surface as an api_minute_burst
+    // row keyed by the user (via the Axiom customer_id read). Without the
+    // apiAccess gate, limit=0 would classify five active minutes as a phantom
+    // sustained_burst and fire an "over API plan limit" upsell email.
+    const summary = await t.action(usageFns.scanApiPlanLimitUsageInternal, {
+      now: NOW,
+      rows: [{
+        userId: "user-pro",
+        dimension: "api_minute_burst",
+        usage: 500,
+        minuteBuckets: [500, 500, 500, 500, 500],
+        source: "test",
+      }],
+    });
+
+    expect(summary.evaluated).toBe(0);
+    expect(summary.wouldNotify).toBe(0);
+    expect(summary.notified).toBe(0);
+    expect(summary.skipped).toContainEqual({
+      userId: "user-pro",
+      dimension: "api_minute_burst",
+      reason: "no_api_access",
+    });
+    const notices = await t.run((ctx) => ctx.db.query("apiPlanLimitNotices").collect());
+    expect(notices).toHaveLength(0);
+  });
+
+  test("an HTTP-200 Axiom body with no result envelope blocks the dimension, not false-clears", async () => {
+    const t = convexTest(schema, modules);
+    await seedEntitlement(t, "user-pro", "pro_monthly");
+
+    // Scan 1 (injected): trip a sustained mcp burst so a live notice exists.
+    await t.action(usageFns.scanApiPlanLimitUsageInternal, {
+      now: NOW,
+      rows: [{
+        userId: "user-pro",
+        dimension: "mcp_minute_burst",
+        usage: 90,
+        minuteBuckets: [61, 62, 63, 65, 66],
+        source: "axiom:mcp_rate_limit_hit",
+      }],
+    });
+    expect((await t.run((ctx) => ctx.db.query("apiPlanLimitNotices").collect())).filter((n) => n.current)).toHaveLength(1);
+
+    // Scan 2 (production path): Axiom answers HTTP 200 but with a non-result body
+    // (an error object, no matches/tables/rows array). normalizeAxiomRows would
+    // yield [] -- indistinguishable from a genuinely empty result -- so without
+    // the shape guard the recovery sweep reads mcp_minute_burst as healthy-empty
+    // and clears the live notice. It must degrade to a blocked source instead.
+    vi.stubEnv("AXIOM_QUERY_TOKEN", "test-token");
+    vi.stubGlobal("fetch", vi.fn(async () =>
+      new Response(JSON.stringify({ error: "query failed", code: "bad_apl" }), { status: 200 }),
+    ));
+    const summary = await t.action(usageFns.scanApiPlanLimitUsageInternal, { now: NOW + 3_600_000 });
+
+    expect(summary.blocked.some((b: { reason?: string }) => b.reason === "axiom_unexpected_body")).toBe(true);
+    expect((await t.run((ctx) => ctx.db.query("apiPlanLimitNotices").collect())).filter((n) => n.current)).toHaveLength(1);
+  });
+
+  test("mcp_daily_calls for a Pro account uses the Redis counter, dropping the dual Axiom row", async () => {
+    const t = convexTest(schema, modules);
+    await seedEntitlement(t, "user-pro", "pro_monthly");
+    vi.stubEnv("AXIOM_QUERY_TOKEN", "test-token");
+    vi.stubEnv("UPSTASH_REDIS_REST_URL", "https://upstash.test");
+    vi.stubEnv("UPSTASH_REDIS_REST_TOKEN", "upstash-token");
+
+    // The Axiom mcp.toolcall count reads 80 (it also tallies quota-exempt calls);
+    // the authoritative enforcement Redis counter reads 60. Both exceed the 50/day
+    // Pro cap, but only ONE mcp_daily row must be evaluated and it must carry the
+    // Redis 60, not the Axiom 80 -- the dual row otherwise flaps the notice.
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("api.axiom.co")) {
+        const apl = JSON.parse(String(init?.body)).apl as string;
+        if (apl.includes("mcp.toolcall")) {
+          return new Response(JSON.stringify({ matches: [{ data: { user_id: "user-pro", usage: 80 } }] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ matches: [] }), { status: 200 });
+      }
+      if (u.includes("mcp%3Apro-usage")) return new Response(JSON.stringify({ result: "60" }), { status: 200 });
+      return new Response(JSON.stringify({ result: "0" }), { status: 200 });
+    }));
+
+    const summary = await t.action(usageFns.scanApiPlanLimitUsageInternal, { now: NOW });
+
+    // Exactly one mcp_daily row -> the Axiom duplicate was dropped for the Pro user.
+    expect(summary.evaluated).toBe(1);
+    const mcp = (await t.run((ctx) => ctx.db.query("apiPlanLimitNotices").collect()))
+      .filter((n) => n.dimension === "mcp_daily_calls" && n.current);
+    expect(mcp).toHaveLength(1);
+    expect(mcp[0].state).toBe("over_limit");
+    expect(mcp[0].usage).toBe(60); // Redis counter, not the Axiom 80
+  });
+
   test("skips rows that cannot be joined to an active entitlement", async () => {
     const t = convexTest(schema, modules);
 

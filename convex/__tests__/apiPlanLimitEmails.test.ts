@@ -67,7 +67,7 @@ describe("api plan-limit email delivery", () => {
       return new Response(JSON.stringify({ id: "email_1" }), { status: 200 });
     }) as typeof fetch;
 
-    const summary = await t.action(emailFns.sendDuePlanLimitEmails, { now: NOW + 1_000 });
+    const summary = await t.action(emailFns.sendDuePlanLimitEmails, { now: NOW + 1_000, live: true });
     expect(summary).toMatchObject({ considered: 1, sent: 1, skipped: 0, failed: 0 });
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({
@@ -78,6 +78,33 @@ describe("api plan-limit email delivery", () => {
     const notices = await t.run((ctx) => ctx.db.query("apiPlanLimitNotices").collect());
     expect(notices[0].emailStatus).toBe("sent");
     expect(notices[0].lastEmailedAt).toBe(NOW + 1_000);
+  });
+
+  test("dry-run kill-switch (no live flag) sends nothing and leaves notices pending", async () => {
+    const t = convexTest(schema, modules);
+    await seedNotice(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("customers", {
+        userId: "user-api",
+        email: "owner@example.com",
+        normalizedEmail: "owner@example.com",
+        createdAt: NOW,
+        updatedAt: NOW,
+      });
+    });
+    // Even with a Resend key and a due, deliverable notice, the default run must
+    // NOT send: PLAN_LIMIT_NOTIFY_LIVE is unset and no `live` arg is passed.
+    process.env.RESEND_API_KEY = "resend-test";
+    delete process.env.PLAN_LIMIT_NOTIFY_LIVE;
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const summary = await t.action(emailFns.sendDuePlanLimitEmails, { now: NOW + 1_000 });
+    expect(summary).toMatchObject({ considered: 1, sent: 0, skipped: 0, failed: 0, dryRun: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const notices = await t.run((ctx) => ctx.db.query("apiPlanLimitNotices").collect());
+    expect(notices[0]).toMatchObject({ emailStatus: "pending", current: true });
   });
 
   test("suppressed recipient marks notice suppressed without calling Resend", async () => {
@@ -100,7 +127,7 @@ describe("api plan-limit email delivery", () => {
     process.env.RESEND_API_KEY = "resend-test";
     globalThis.fetch = vi.fn() as unknown as typeof fetch;
 
-    const summary = await t.action(emailFns.sendDuePlanLimitEmails, { now: NOW + 1_000 });
+    const summary = await t.action(emailFns.sendDuePlanLimitEmails, { now: NOW + 1_000, live: true });
     expect(summary).toMatchObject({ considered: 1, sent: 0, skipped: 1, failed: 0 });
     expect(globalThis.fetch).not.toHaveBeenCalled();
 
@@ -113,7 +140,7 @@ describe("api plan-limit email delivery", () => {
     await seedNotice(t);
     process.env.RESEND_API_KEY = "resend-test";
 
-    const summary = await t.action(emailFns.sendDuePlanLimitEmails, { now: NOW + 1_000 });
+    const summary = await t.action(emailFns.sendDuePlanLimitEmails, { now: NOW + 1_000, live: true });
     expect(summary).toMatchObject({ considered: 1, sent: 0, skipped: 1, failed: 0 });
 
     const notices = await t.run((ctx) => ctx.db.query("apiPlanLimitNotices").collect());
@@ -152,7 +179,7 @@ describe("api plan-limit email delivery", () => {
       return new Response(JSON.stringify({ id: "email_2" }), { status: 200 });
     }) as typeof fetch;
 
-    await expect(t.action(emailFns.sendDuePlanLimitEmails, { now: NOW + 1_000 }))
+    await expect(t.action(emailFns.sendDuePlanLimitEmails, { now: NOW + 1_000, live: true }))
       .rejects
       .toThrow("[apiPlanLimitEmails] 1 email delivery failure");
     expect(calls).toEqual(["one@example.com", "two@example.com"]);

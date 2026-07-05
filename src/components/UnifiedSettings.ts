@@ -1090,6 +1090,22 @@ export class UnifiedSettings {
       return;
     }
     if (notice.ctaKind === 'checkout') {
+      // Never send an active subscriber to a fresh checkout. The upgrade target
+      // (api_starter) sits in a DIFFERENT tierGroup than an existing Pro sub, and
+      // getCheckoutBlockingSubscription only blocks a same-tierGroup duplicate
+      // (#4797) — so startCheckout would STACK a second live subscription and
+      // double-charge. Route entitled users to the billing portal instead (same
+      // precedent as handleUpgradeClick); its no-customer outcome surfaces the
+      // support path for a subscription managed outside Dodo.
+      if (isEntitled()) {
+        const reservedWin = prereserveBillingPortalTab();
+        void openBillingPortal(reservedWin).then((result) => {
+          if (result.outcome === 'no-customer') {
+            showToast('Subscription is managed outside Dodo. Email support@worldmonitor.app for help.');
+          }
+        });
+        return;
+      }
       this.close();
       import('@/services/checkout').then(m => import('@/config/products').then((p) => {
         const product = notice.upgradeTargetPlanKey === 'api_starter'

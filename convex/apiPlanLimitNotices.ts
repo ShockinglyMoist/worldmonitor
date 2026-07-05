@@ -97,15 +97,22 @@ export function classifyUsageThreshold(
   const { dimension, usage, limit } = input;
   if (limit == null) return null;
 
+  // A non-positive plan limit means the dimension is not part of this plan's
+  // allowance at all (e.g. Pro carries apiBurstRequestsPerMinute:0). Resolve it
+  // BEFORE the burst-bucket branch: otherwise a 0 limit turns `value > limit`
+  // into "any active minute", so a handful of ordinary requests would classify
+  // as a phantom sustained_burst. Handling it first makes burst and daily dims
+  // agree — any usage is over_limit, none is a no-op.
+  if (limit <= 0) {
+    return usage > 0 ? "over_limit" : null;
+  }
+
   if (isBurstDimension(dimension)) {
     const buckets = (input.minuteBuckets ?? []).slice(-SUSTAINED_BURST_BUCKETS);
     const overLimit = buckets.filter((value) => value > limit).length;
     return overLimit >= SUSTAINED_BURST_MIN_OVER_LIMIT ? "sustained_burst" : null;
   }
 
-  if (limit <= 0) {
-    return usage > 0 ? "over_limit" : null;
-  }
   if (usage >= limit) return "over_limit";
   if (usage >= limit * WARNING_RATIO) return "warning";
   return null;

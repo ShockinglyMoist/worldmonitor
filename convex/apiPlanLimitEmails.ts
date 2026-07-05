@@ -170,10 +170,31 @@ export const sendDuePlanLimitEmails = internalAction({
   args: {
     now: v.optional(v.number()),
     limit: v.optional(v.number()),
+    // Delivery kill-switch. When omitted, live sending requires the
+    // PLAN_LIMIT_NOTIFY_LIVE=1 env var; tests pass `live: true` explicitly.
+    live: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    const apiKey = process.env.RESEND_API_KEY;
     const now = args.now ?? Date.now();
+    // Default to DRY-RUN. The hourly cron passes no args, so a fresh deploy must
+    // not blast live mail one minute later — sending is gated behind an explicit
+    // PLAN_LIMIT_NOTIFY_LIVE=1 flag an operator flips only after the notice
+    // pipeline is verified. In dry-run we touch no notice: due rows stay
+    // `pending` and deliver on the first live run.
+    const live = args.live ?? process.env.PLAN_LIMIT_NOTIFY_LIVE === "1";
+    const due = await ctx.runQuery(
+      (internal as any).apiPlanLimitNotices.listEmailDue,
+      { now, limit: args.limit ?? 50 },
+    ) as NoticeEmailRow[];
+
+    if (!live) {
+      console.log(
+        `[apiPlanLimitEmails] dry-run (PLAN_LIMIT_NOTIFY_LIVE!=1): ${due.length} notice(s) due, none sent`,
+      );
+      return { considered: due.length, sent: 0, skipped: 0, failed: 0, dryRun: true };
+    }
+
+    const apiKey = process.env.RESEND_API_KEY;
     // Missing config is not a per-notice failure. Bail before touching any
     // notice so due notices stay `pending` (not poisoned to `failed`, which
     // would burn attempts / force a backoff) and deliver on the next run once
@@ -181,10 +202,6 @@ export const sendDuePlanLimitEmails = internalAction({
     if (!apiKey) {
       throw new Error("[apiPlanLimitEmails] RESEND_API_KEY not configured; skipped email delivery");
     }
-    const due = await ctx.runQuery(
-      (internal as any).apiPlanLimitNotices.listEmailDue,
-      { now, limit: args.limit ?? 50 },
-    ) as NoticeEmailRow[];
 
     const summary = { considered: due.length, sent: 0, skipped: 0, failed: 0 };
     const failureMessages: string[] = [];

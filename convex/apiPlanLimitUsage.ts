@@ -145,6 +145,21 @@ function noticeForRow(
   return { state, ...dodoUpgradeNotice(planKey, row.dimension) };
 }
 
+// A recognized Axiom `?format=legacy` result envelope carries its rows under one
+// of these array fields — an EMPTY array is a valid "no rows" result. Anything
+// else at HTTP 200 (an error object, a drifted schema, a bare non-result body)
+// is NOT a result: it must block the dimension, never read as zero usage, or the
+// recovery sweep would treat it as "healthy but empty" and false-clear live
+// notices. Keep the branches in sync with normalizeAxiomRows.
+function isRecognizedAxiomResultShape(data: unknown): boolean {
+  const d = data as any;
+  return (
+    Array.isArray(d?.matches) ||
+    Array.isArray(d?.tables?.[0]?.rows) ||
+    Array.isArray(d?.rows)
+  );
+}
+
 function normalizeAxiomRows(data: unknown, dimension: PlanLimitDimension): ScannerUsageRow[] {
   const rawRows =
     Array.isArray((data as any)?.matches)
@@ -200,7 +215,14 @@ async function queryAxiom(apl: string, dimension: PlanLimitDimension): Promise<{
     if (!resp.ok) {
       return { rows: [], blockedReason: `axiom_query_http_${resp.status}` };
     }
-    return { rows: normalizeAxiomRows(await resp.json(), dimension) };
+    const json = await resp.json();
+    if (!isRecognizedAxiomResultShape(json)) {
+      // HTTP 200 but not a result envelope — an Axiom error body or drifted
+      // schema. Block the dimension instead of letting normalizeAxiomRows yield
+      // an empty [] that reads identically to a genuinely-empty result.
+      return { rows: [], blockedReason: "axiom_unexpected_body" };
+    }
+    return { rows: normalizeAxiomRows(json, dimension) };
   } catch {
     return { rows: [], blockedReason: "axiom_query_error" };
   }
@@ -305,6 +327,7 @@ async function buildProductionRows(
   // single counter with no 5-bucket history to express sustained_burst.
   const burstApl = `['wm_api_usage']
 | where event_type == "request" and _time > ago(10m)
+| where auth_kind in ("user_api_key", "enterprise_api_key") and status < 400
 | where isnotnull(customer_id) and customer_id != ""
 | summarize usage = count() by customer_id, minute = bin(_time, 1m)`;
   const burst = await queryAxiom(burstApl, "api_minute_burst");
@@ -329,15 +352,30 @@ async function buildProductionRows(
     }
   }
 
+  // mcp_daily_calls for Pro accounts is authoritatively metered by the Redis
+  // mcp:pro-usage counter (read in the Upstash block below), NOT the Axiom
+  // mcp.toolcall count. The Axiom count also tallies quota-EXEMPT calls, so it
+  // reads structurally higher, and dual-sourcing mints a second row that flaps
+  // the same-dimension notice within one scan. Drop the Axiom row for those
+  // users so the Redis read (or its blocked entry) is their single source; the
+  // Axiom row still stands for api-tier mcpAccess plans that have no Redis
+  // counter. Mirrors the U8 api_daily_requests move to a single Redis source.
+  const redisMcpDailyUsers = new Set(
+    active
+      .filter((e) => (e.planKey === "pro_monthly" || e.planKey === "pro_annual") && e.mcpAccess)
+      .map((e) => e.userId),
+  );
   const mcpDailyApl = `['wm_api_usage']
 | where tag == "mcp.toolcall" and ok == true and _time >= datetime(${day}T00:00:00Z)
 | where isnotnull(user_id) and user_id != ""
 | summarize usage = count() by user_id`;
   const mcpDaily = await queryAxiom(mcpDailyApl, "mcp_daily_calls");
-  rows.push(...mcpDaily.rows.map((row) => ({
-    ...row,
-    source: "axiom:mcp_toolcall",
-  })));
+  rows.push(...mcpDaily.rows
+    .filter((row) => !redisMcpDailyUsers.has(row.userId))
+    .map((row) => ({
+      ...row,
+      source: "axiom:mcp_toolcall",
+    })));
   if (mcpDaily.blockedReason) blocked.push({ dimension: "mcp_daily_calls", reason: mcpDaily.blockedReason });
 
   const mcpBurstApl = `['wm_api_usage']
@@ -454,6 +492,18 @@ async function scanHandler(ctx: any, args: {
     const ent = byUser.get(row.userId);
     if (!ent) {
       summary.skipped.push({ userId: row.userId, dimension: row.dimension, reason: "unknown_or_inactive_entitlement" });
+      continue;
+    }
+    // An api_* dimension only applies to accounts that actually hold API access.
+    // Pro (and free) entitlements have apiAccess:false but a 0 planLimit for the
+    // api dims, and their ordinary Clerk-session dashboard traffic still lands in
+    // wm_api_usage with a customer_id — so without this gate the Axiom burst read
+    // would attribute those requests to the Pro user and mint a false
+    // "over API plan limit" notice + upsell email. Mirrors the daily read, which
+    // only pushes api_daily_requests rows for apiAccess entitlements.
+    const isApiDimension = row.dimension === "api_daily_requests" || row.dimension === "api_minute_burst";
+    if (isApiDimension && !ent.apiAccess) {
+      summary.skipped.push({ userId: row.userId, dimension: row.dimension, reason: "no_api_access" });
       continue;
     }
     const planKey = row.planKey ?? ent.planKey;
