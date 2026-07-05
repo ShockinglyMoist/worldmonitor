@@ -88,23 +88,45 @@ export const RATE_LIMIT_DEGRADED_HEADERS = {
   'Retry-After': '5',
 } as const;
 
+// Header a Cloudflare Transform Rule injects on every proxied request to prove
+// the request actually transited CF. Keep in sync with api/_client-ip.js.
+const CF_EDGE_PROOF_HEADER = 'x-wm-edge-proof';
+
+// Constant-time comparison for the edge-proof secret. Synchronous so getClientIp
+// stays sync (per-request rate-limit hot path, several non-awaiting callers).
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+// True only when the request proves it transited Cloudflare. If
+// CF_EDGE_PROOF_SECRET is unset, do not trust cf-connecting-ip; fall back to
+// x-real-ip/UNKNOWN so a missing deployment secret cannot silently reopen
+// GHSA-c267.
+function cfTransitProven(request: Request): boolean {
+  const secret = (process.env.CF_EDGE_PROOF_SECRET ?? '').trim();
+  if (!secret) return false;
+  return constantTimeEqual((request.headers.get(CF_EDGE_PROOF_HEADER) ?? '').trim(), secret);
+}
+
 export function getClientIp(request: Request): string {
-  // With Cloudflare proxy → Vercel, x-real-ip is the CF edge IP (shared across
-  // users). cf-connecting-ip is the actual client IP set by Cloudflare —
-  // prefer it.
-  //
-  // x-forwarded-for is client-settable and MUST NOT be trusted for
-  // rate limiting (#3531) — without that fallback removed, a caller bypassing
-  // CF entirely (direct request) could rotate identities by toggling the
-  // header and beat the per-IP window. When neither trusted header is
-  // present we return the UNKNOWN_CLIENT_IP sentinel so Upstash treats the
-  // whole untrusted-identity population as one shared bucket.
+  // cf-connecting-ip is only unforgeable for traffic that actually transited
+  // Cloudflare (x-real-ip is then the CF edge IP, shared across users). On a
+  // direct-to-origin hit (bypassing CF) cf-connecting-ip is fully client-
+  // controlled, so a caller sending a fresh value per request rotates the
+  // per-IP window and neutralises the limit (GHSA-c267). Trust it only with
+  // proof of CF transit. Otherwise fall back to x-real-ip (the real peer IP)
+  // then the UNKNOWN_CLIENT_IP sentinel — the spoofable cf-connecting-ip and
+  // the client-settable x-forwarded-for (#3531) are deliberately NOT fallbacks.
   //
   // Trim each header value before falling through — a whitespace-only
   // cf-connecting-ip would otherwise short-circuit past x-real-ip.
   const cf = (request.headers.get('cf-connecting-ip') ?? '').trim();
   const xr = (request.headers.get('x-real-ip') ?? '').trim();
-  return cf || xr || UNKNOWN_CLIENT_IP;
+  if (cf && cfTransitProven(request)) return cf;
+  return xr || UNKNOWN_CLIENT_IP;
 }
 
 function tooManyRequestsResponse(limit: number, reset: number, corsHeaders: Record<string, string>): Response {
@@ -183,8 +205,27 @@ interface EndpointRatePolicy {
 // using checkEndpointRateLimit / hasEndpointRatePolicy below — the export is
 // for tooling, not new runtime callers.
 export const ENDPOINT_RATE_POLICIES: Record<string, EndpointRatePolicy> = {
+  // LLM article summarization is Pro-gated, but still needs a scoped,
+  // fail-closed budget so Redis degradation cannot silently lift the
+  // per-endpoint spend control.
+  '/api/news/v1/summarize-article': { limit: 30, window: '60 s' },
   '/api/news/v1/summarize-article-cache': { limit: 3000, window: '60 s' },
   '/api/intelligence/v1/classify-event': { limit: 600, window: '60 s' },
+  // LLM-backed situational deduction (imports callLlmReasoning) can drive
+  // provider spend on cache misses, so it must fail closed on Redis outage
+  // rather than inherit the global fail-open fallback. Mirror the sibling
+  // classify-event budget (same limit/window) — both are AI-backed Intelligence
+  // RPCs. (#4676)
+  '/api/intelligence/v1/deduct-situation': { limit: 600, window: '60 s' },
+  // Batch humanitarian-summary fans out to the external HAPI (humdata) provider
+  // on cache miss — up to 25 countries per request, 5 concurrent upstream
+  // fetches. Batch aircraft-details fans out to the external Wingbits provider —
+  // up to 10 ICAO24 lookups per request. Both proxy external providers, so keep
+  // them at the same 30/min budget as the other provider-proxy routes
+  // (sanctions lookup / resilience ranking); conservative because a single
+  // request already amplifies into many upstream calls. (#4676)
+  '/api/conflict/v1/get-humanitarian-summary-batch': { limit: 30, window: '60 s' },
+  '/api/military/v1/get-aircraft-details-batch': { limit: 30, window: '60 s' },
   // Legacy /api/sanctions-entity-search rate limit was 30/min per IP. Preserve
   // that budget now that LookupSanctionEntity proxies OpenSanctions live.
   '/api/sanctions/v1/lookup-sanction-entity': { limit: 30, window: '60 s' },
@@ -219,6 +260,86 @@ export const ENDPOINT_RATE_POLICIES: Record<string, EndpointRatePolicy> = {
   // resolves edge-function paths via api/api-route-exceptions.json instead
   // of the OpenAPI specs.
   '/api/mcp-proxy': { limit: 30, window: '60 s' },
+};
+
+interface RateLimitPolicyDecision {
+  reason: string;
+}
+
+// Repo-native guardrail for routes where the rate-limit is part of the abuse
+// defence. scripts/enforce-rate-limit-policies.mjs fails if any route listed
+// here can drift back to the gateway's availability-first global fallback.
+export const FAIL_CLOSED_ENDPOINT_RATE_POLICY_REQUIRED: Record<string, RateLimitPolicyDecision> = {
+  '/api/news/v1/summarize-article': {
+    reason: 'LLM-backed summarization can drive provider spend on cache misses.',
+  },
+  '/api/intelligence/v1/classify-event': {
+    reason: 'AI classification performs expensive provider-backed analysis.',
+  },
+  '/api/intelligence/v1/deduct-situation': {
+    reason: 'LLM-backed situational deduction can drive provider spend on cache misses.',
+  },
+  '/api/conflict/v1/get-humanitarian-summary-batch': {
+    reason: 'Batch summary fans out to the external HAPI (humdata) provider on cache miss.',
+  },
+  '/api/military/v1/get-aircraft-details-batch': {
+    reason: 'Batch enrichment fans out to the external Wingbits provider on cache miss.',
+  },
+  '/api/sanctions/v1/lookup-sanction-entity': {
+    reason: 'Live sanctions lookup proxies an external provider.',
+  },
+  '/api/leads/v1/submit-contact': {
+    reason: 'Lead capture writes to Convex and sends email.',
+  },
+  '/api/leads/v1/register-interest': {
+    reason: 'Lead capture writes to Convex and sends email.',
+  },
+  '/api/scenario/v1/run-scenario': {
+    reason: 'Scenario runs are mutation-like jobs with a historical 10/min cap.',
+  },
+  '/api/forecast/v1/trigger-simulation': {
+    reason: 'Forecast simulation trigger starts expensive backend work.',
+  },
+  '/api/maritime/v1/get-vessel-snapshot': {
+    reason: 'Live vessel snapshots can generate high-frequency upstream load.',
+  },
+  '/api/resilience/v1/get-resilience-ranking': {
+    reason: 'Cold/stale cache paths can synchronously warm the full country table.',
+  },
+};
+
+// Explicit examples of read-only gateway routes where the global per-IP
+// fallback remains acceptable during Redis degradation. New expensive/provider
+// routes should not be added here; add them to ENDPOINT_RATE_POLICIES and
+// FAIL_CLOSED_ENDPOINT_RATE_POLICY_REQUIRED instead.
+export const GLOBAL_RATE_LIMIT_FALLBACK_READ_ROUTES: Record<string, RateLimitPolicyDecision> = {
+  '/api/aviation/v1/list-airport-delays': {
+    reason: 'Read-only cache-backed airport delay listing; availability-first fallback is acceptable.',
+  },
+};
+
+// Explicit allow-list of NON-GET (post/put/patch/delete) gateway routes that are
+// permitted to inherit the global availability-first fallback during a Redis
+// outage instead of declaring an ENDPOINT_RATE_POLICIES entry. The audit
+// scripts/enforce-rate-limit-policies.mjs fails CI if any generated non-GET
+// route is neither in ENDPOINT_RATE_POLICIES nor listed here — so a newly added
+// expensive/mutation route can no longer silently fail open. Every entry MUST
+// carry a justification for why fail-open is safe for that route. When a route
+// becomes provider-backed / spend-bearing, move it to ENDPOINT_RATE_POLICIES +
+// FAIL_CLOSED_ENDPOINT_RATE_POLICY_REQUIRED instead of keeping it here. (#4676)
+export const RATE_LIMIT_MUTATION_FALLBACK_EXEMPT: Record<string, RateLimitPolicyDecision> = {
+  '/api/economic/v1/get-fred-series-batch': {
+    reason:
+      'Read-only despite POST shape: reads seeded FRED data from the Redis seed cache only; all external FRED API calls happen in the Railway seed job, so a cache miss never fans out to an external provider.',
+  },
+  '/api/infrastructure/v1/record-baseline-snapshot': {
+    reason:
+      'Redis-only write (setCachedJson) with no external provider or LLM call; if Redis is degraded the write itself cannot land, so the fail-open fallback carries no spend/abuse risk.',
+  },
+  '/api/v2/shipping/webhooks': {
+    reason:
+      'Webhook registration is API-key authenticated (validateApiKey) and premium-gated before any work, so unauthenticated abuse is already blocked; the handler only writes to Redis, with no external provider or LLM spend.',
+  },
 };
 
 const endpointLimiters = new Map<string, Ratelimit>();

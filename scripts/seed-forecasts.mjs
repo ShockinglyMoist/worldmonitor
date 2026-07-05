@@ -14042,7 +14042,10 @@ const FORECAST_LLM_PROVIDERS = [
   { name: 'openrouter', envKey: 'OPENROUTER_API_KEY', apiUrl: 'https://openrouter.ai/api/v1/chat/completions', model: 'google/gemini-2.5-flash', timeout: 25_000 },
 ];
 const FORECAST_LLM_PROVIDER_NAMES = new Set(FORECAST_LLM_PROVIDERS.map(provider => provider.name));
-const FORECAST_LLM_PROVIDER_MAX_RETRIES = 2;
+// 3 retries (=4 attempts/provider): during an OpenRouter slowdown 2 retries all timed
+// out and market_implications wrote an error seed-meta. Bounded by the per-stage /
+// per-run LLM budgets below, so extra attempts can't blow the 180s seed lock.
+const FORECAST_LLM_PROVIDER_MAX_RETRIES = 3;
 const FORECAST_LLM_RETRY_BASE_MS = 1_000;
 const FORECAST_LLM_RETRY_AFTER_MAX_MS = 10_000;
 // The forecast seed lock is 180s; leave headroom for non-LLM work and cleanup.
@@ -14134,6 +14137,19 @@ function resolveForecastLlmProviders(options = {}) {
     });
   }
   return providers.length > 0 ? providers : FORECAST_LLM_PROVIDERS;
+}
+
+function moveForecastLlmProviderToBack(options = {}, providerName = '') {
+  if (!providerName) return options;
+  const requestedOrder = Array.isArray(options.providerOrder) && options.providerOrder.length > 0
+    ? options.providerOrder
+    : FORECAST_LLM_PROVIDERS.map(provider => provider.name);
+  const providerOrder = [...new Set(requestedOrder.filter(name => FORECAST_LLM_PROVIDER_NAMES.has(name)))];
+  if (providerOrder.length < 2 || !providerOrder.includes(providerName)) return options;
+  return {
+    ...options,
+    providerOrder: [...providerOrder.filter(name => name !== providerName), providerName],
+  };
 }
 
 function summarizeForecastLlmOptions(options = {}) {
@@ -14370,6 +14386,10 @@ async function __callForecastLlmForTests(systemPrompt, userPrompt, options = {})
   return await callForecastLLM(systemPrompt, userPrompt, options);
 }
 
+async function __redisSetForTests(url, token, key, data, ttlSeconds) {
+  return await redisSet(url, token, key, data, ttlSeconds);
+}
+
 function getForecastLlmRetryAfterMs(resp) {
   const retryAfterMs = parseRetryAfterMs(getResponseHeader(resp?.headers, 'Retry-After'));
   return retryAfterMs == null ? null : Math.min(retryAfterMs, FORECAST_LLM_RETRY_AFTER_MAX_MS);
@@ -14501,12 +14521,29 @@ async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
 async function redisSet(url, token, key, data, ttlSeconds) {
   if (_testRedisStore) { _testRedisStore[key] = JSON.parse(JSON.stringify(data)); return; }
   try {
-    await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(['SET', key, JSON.stringify(data), 'EX', ttlSeconds]),
-      signal: AbortSignal.timeout(5_000),
-    });
+    // Best-effort cache write. The 10s timeout addresses the root cause (the observed
+    // write needed >5s — "[Redis] Cache write failed for intelligence:market-
+    // implications:v1: aborted due to timeout"); a single retry catches a transient
+    // drop. Kept to ONE retry (not 2) because redisSet is a shared helper called from
+    // ~10 sites incl. a Promise.all batch, none budget-aware — this bounds worst-case
+    // tail latency to ~20s. 4xx stays non-retryable so withRetry bails in ~10ms.
+    await withRetry(async () => {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'User-Agent': CHROME_UA,
+        },
+        body: JSON.stringify(['SET', key, JSON.stringify(data), 'EX', ttlSeconds]),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!resp.ok) {
+        const err = new Error(`HTTP ${resp.status}`);
+        err.nonRetryable = !isRetryableHttpStatus(resp.status);
+        throw err;
+      }
+    }, 1, 500);
   } catch (err) { console.warn(`  [Redis] Cache write failed for ${key}: ${err.message}`); }
 }
 
@@ -14757,6 +14794,32 @@ async function recoverScenarioNarratives(predictions, llmOptions = {}, stage = '
   };
 }
 
+// Bounded re-call of the scenario LLM when a complete-but-plausible response still
+// validates to zero scenarios AND zero case narratives (logged as llm_scenario
+// failureReason="validation_failed" → scenarios=0). withRetry only re-tries transport
+// failures, not a 200 that parses to nothing, so this validation-aware retry lives
+// here. Bounded by the run budget: callForecastLLM returns null once the budget is
+// exhausted, which ends the loop.
+const SCENARIO_LLM_VALIDATION_RETRIES = 1;
+
+async function resolveScenarioLlmResult(scenarioOnly, scenarioLlmOptions, maxValidationRetries = SCENARIO_LLM_VALIDATION_RETRIES) {
+  let last = { result: null, parsed: null, raw: null, valid: [], validCases: [] };
+  let callOptions = { ...scenarioLlmOptions, stage: 'scenario' };
+  for (let attempt = 0; attempt <= maxValidationRetries; attempt++) {
+    if (attempt > 0) console.log(`  [LLM:scenario] validation retry ${attempt + 1}/${maxValidationRetries + 1} (prior attempt validated to 0)`);
+    const result = await callForecastLLM(SCENARIO_SYSTEM_PROMPT, buildUserPrompt(scenarioOnly), callOptions);
+    if (!result) break; // provider failure / budget exhausted — keep the last (possibly empty) result
+    const parsed = extractStructuredLlmPayload(result.text);
+    const raw = parsed.items;
+    const valid = validateScenarios(raw, scenarioOnly);
+    const validCases = validateCaseNarratives(raw, scenarioOnly);
+    last = { result, parsed, raw, valid, validCases };
+    if (valid.length > 0 || validCases.length > 0) break;
+    callOptions = moveForecastLlmProviderToBack(callOptions, result.provider);
+  }
+  return last;
+}
+
 async function enrichScenariosWithLLM(predictions) {
   if (predictions.length === 0) return null;
   const { url, token } = getRedisCredentials();
@@ -14983,12 +15046,8 @@ async function enrichScenariosWithLLM(predictions) {
       console.log('  [LLM:scenario] cache miss');
       const t0 = Date.now();
       console.log('  [LLM:scenario] invoking provider');
-      const result = await callForecastLLM(SCENARIO_SYSTEM_PROMPT, buildUserPrompt(scenarioOnly), { ...scenarioLlmOptions, stage: 'scenario' });
+      const { result, parsed, raw, valid, validCases } = await resolveScenarioLlmResult(scenarioOnly, scenarioLlmOptions);
       if (result) {
-        const parsed = extractStructuredLlmPayload(result.text);
-        const raw = parsed.items;
-        const valid = validateScenarios(raw, scenarioOnly);
-        const validCases = validateCaseNarratives(raw, scenarioOnly);
         enrichmentMeta.scenario.source = 'live';
         enrichmentMeta.scenario.provider = result.provider;
         enrichmentMeta.scenario.model = result.model;
@@ -17511,6 +17570,7 @@ export {
   parseForecastProviderOrder,
   getForecastLlmCallOptions,
   resolveForecastLlmProviders,
+  resolveScenarioLlmResult,
   buildFallbackScenario,
   buildFallbackBaseCase,
   buildFallbackEscalatoryCase,
@@ -17637,6 +17697,7 @@ export {
   readImpactPromptLearnedSection,
   clearImpactPromptLearnedSection,
   __callForecastLlmForTests,
+  __redisSetForTests,
   __setForecastLlmCallOverrideForTests,
   __setForecastLlmTransportForTests,
   __setForecastLlmRunDeadlineForTests,

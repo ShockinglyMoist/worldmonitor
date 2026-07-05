@@ -18,11 +18,19 @@ import { jsonResponse } from './_json-response.js';
 import { captureSilentError } from './_sentry-edge.js';
 // @ts-expect-error — JS module, no declaration file
 import { extractConvexErrorKind, isOpaqueConvexServerError, readConvexErrorNumber } from './_convex-error.js';
+import {
+  beginStandaloneIdempotency,
+  completeStandaloneIdempotency,
+  getIdempotencyKey,
+  peekStandaloneIdempotency,
+} from './_idempotency.js';
 import { ConvexHttpClient } from 'convex/browser';
 import { validateBearerToken } from '../server/auth-session';
 import { checkScopedRateLimit } from '../server/_shared/rate-limit';
 
 export const USER_PREFS_WRITE_RATE_SCOPE = 'user-prefs-write';
+// Keep in lockstep with convex/constants.ts; tests/user-prefs-rate-limit.test.mts
+// guards the duplicated Edge/Convex rate-limit contract from drifting.
 export const USER_PREFS_WRITE_RATE_LIMIT = 30;
 export const USER_PREFS_WRITE_RATE_WINDOW = '60 s';
 
@@ -61,6 +69,27 @@ export function __setUserPrefsDepsForTests(overrides: Partial<UserPrefsDeps> | n
     : createDefaultUserPrefsDeps();
 }
 
+type SetPreferencesResult =
+  | { ok: true; syncVersion: number }
+  | { ok: false; reason: 'CONFLICT'; actualSyncVersion: number }
+  | { ok: false; reason: 'BLOB_TOO_LARGE'; size: number; max: number }
+  | { ok: false; reason: 'RATE_LIMITED'; limit: number; reset: number };
+
+function rateLimitHeaders(
+  cors: Record<string, string>,
+  limit: number,
+  reset: number,
+): Record<string, string> {
+  const retryAfter = Math.max(1, Math.ceil((reset - Date.now()) / 1000));
+  return {
+    ...cors,
+    'X-RateLimit-Limit': String(limit),
+    'X-RateLimit-Remaining': '0',
+    'X-RateLimit-Reset': String(reset),
+    'Retry-After': String(retryAfter),
+  };
+}
+
 export default async function handler(
   req: Request,
   ctx?: { waitUntil: (p: Promise<unknown>) => void },
@@ -88,6 +117,20 @@ export default async function handler(
   const session = await userPrefsDeps.validateBearerToken(token);
   if (!session.valid || !session.userId) {
     return jsonResponse({ error: 'UNAUTHENTICATED' }, 401, cors);
+  }
+
+  const idempotencyKey = req.method === 'POST' ? getIdempotencyKey(req) : null;
+  if (idempotencyKey) {
+    const peek = await peekStandaloneIdempotency({
+      request: req,
+      pathname: '/api/user-prefs',
+      scope: `user:${session.userId}`,
+      idempotencyKey,
+      corsHeaders: cors,
+    });
+    if (peek.kind !== 'miss' && peek.kind !== 'disabled') {
+      return peek.response;
+    }
   }
 
   const convexUrl = process.env.CONVEX_URL;
@@ -124,6 +167,25 @@ export default async function handler(
       );
     }
   }
+
+  const idempotency = idempotencyKey
+    ? await beginStandaloneIdempotency({
+      request: req,
+      pathname: '/api/user-prefs',
+      scope: `user:${session.userId}`,
+      idempotencyKey,
+      corsHeaders: cors,
+    })
+    : null;
+  if (
+    idempotency &&
+    idempotency.kind !== 'proceed' &&
+    idempotency.kind !== 'disabled'
+  ) {
+    return idempotency.response;
+  }
+  const finish = (response: Response): Promise<Response> =>
+    completeStandaloneIdempotency(idempotency, response);
 
   // Bound the Convex round-trip below Vercel's 25s edge wall-clock so a
   // stalled platform aborts cleanly into the SERVICE_UNAVAILABLE → 503 +
@@ -204,7 +266,7 @@ export default async function handler(
   try {
     body = await req.json();
   } catch {
-    return jsonResponse({ error: 'Invalid JSON' }, 400, cors);
+    return finish(jsonResponse({ error: 'Invalid JSON' }, 400, cors));
   }
 
   if (
@@ -212,7 +274,7 @@ export default async function handler(
     body.data === undefined ||
     typeof body.expectedSyncVersion !== 'number'
   ) {
-    return jsonResponse({ error: 'MISSING_FIELDS' }, 400, cors);
+    return finish(jsonResponse({ error: 'MISSING_FIELDS' }, 400, cors));
   }
 
   try {
@@ -222,27 +284,29 @@ export default async function handler(
       data: body.data,
       expectedSyncVersion: body.expectedSyncVersion,
       schemaVersion: typeof body.schemaVersion === 'number' ? body.schemaVersion : undefined,
-    })) as
-      | { ok: true; syncVersion: number }
-      | { ok: false; reason: 'CONFLICT'; actualSyncVersion: number };
-    // PR 3 (post-launch-stabilization): setPreferences now returns a
-    // discriminated result for CONFLICT instead of throwing. Wire shape
-    // to the client (HTTP 409 with actualSyncVersion) is unchanged. The
-    // change silences the dozens-per-day "Uncaught ConvexError" log surface
-    // in Convex Insights, which was just the intentional CAS guard. We no
-    // longer captureSilentError on CONFLICT either — PR 1.B's Sentry
-    // attribution served its purpose during the soak window (we used
-    // it to verify the stuck-bundle storm decayed) and is no longer
-    // needed now that CONFLICT is a normal return shape.
+    })) as SetPreferencesResult;
+    // Expected write denials return as a discriminated result so Convex can
+    // commit limiter bookkeeping and duplicate-counter cleanup. Wire shape to
+    // clients stays the same as the older thrown ConvexError paths below.
     if (result.ok === false) {
-      // Discriminated union narrows to the CONFLICT variant here.
-      return jsonResponse(
+      if (result.reason === 'BLOB_TOO_LARGE') {
+        return finish(jsonResponse({ error: 'BLOB_TOO_LARGE' }, 400, cors));
+      }
+      if (result.reason === 'RATE_LIMITED') {
+        console.warn('[user-prefs] POST convex write rate limit exceeded');
+        return finish(jsonResponse(
+          { error: 'RATE_LIMITED' },
+          429,
+          rateLimitHeaders(cors, result.limit, result.reset),
+        ));
+      }
+      return finish(jsonResponse(
         { error: 'CONFLICT', actualSyncVersion: result.actualSyncVersion },
         409,
         cors,
-      );
+      ));
     }
-    return jsonResponse({ syncVersion: result.syncVersion }, 200, cors);
+    return finish(jsonResponse({ syncVersion: result.syncVersion }, 200, cors));
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     const kind = extractConvexErrorKind(err, msg);
@@ -253,7 +317,7 @@ export default async function handler(
     // have soaked on the new code, this branch is unreachable and can be
     // removed (along with handleConflictResponse).
     if (kind === 'CONFLICT') {
-      return handleConflictResponse(err, msg, {
+      return finish(handleConflictResponse(err, msg, {
         userId: session.userId,
         variant: body.variant,
         ctx,
@@ -261,10 +325,20 @@ export default async function handler(
         expectedSyncVersion: body.expectedSyncVersion,
         blobSize: body.data !== undefined ? JSON.stringify(body.data).length : 0,
         cors,
-      });
+      }));
     }
     if (kind === 'BLOB_TOO_LARGE') {
-      return jsonResponse({ error: 'BLOB_TOO_LARGE' }, 400, cors);
+      return finish(jsonResponse({ error: 'BLOB_TOO_LARGE' }, 400, cors));
+    }
+    if (kind === 'RATE_LIMITED') {
+      const limit = readConvexErrorNumber(err, 'limit') ?? USER_PREFS_WRITE_RATE_LIMIT;
+      const reset = readConvexErrorNumber(err, 'reset') ?? Date.now() + 60_000;
+      console.warn('[user-prefs] POST convex write rate limit exceeded');
+      return finish(jsonResponse(
+        { error: 'RATE_LIMITED' },
+        429,
+        rateLimitHeaders(cors, limit, reset),
+      ));
     }
     if (kind === 'UNAUTHENTICATED') {
       // See GET branch above — UNAUTHENTICATED here means Clerk-vs-Convex
@@ -281,7 +355,7 @@ export default async function handler(
         blobSize: body.data !== undefined ? JSON.stringify(body.data).length : 0,
         level: 'warning',
       }));
-      return jsonResponse({ error: 'UNAUTHENTICATED' }, 401, cors);
+      return finish(jsonResponse({ error: 'UNAUTHENTICATED' }, 401, cors));
     }
     if (kind === 'SERVICE_UNAVAILABLE') {
       // See GET branch above — Convex 503, transient. 503 + Retry-After
@@ -297,7 +371,7 @@ export default async function handler(
         blobSize: body.data !== undefined ? JSON.stringify(body.data).length : 0,
         level: 'warning',
       }));
-      return jsonResponse({ error: 'SERVICE_UNAVAILABLE' }, 503, { ...cors, 'Retry-After': '5' });
+      return finish(jsonResponse({ error: 'SERVICE_UNAVAILABLE' }, 503, { ...cors, 'Retry-After': '5' }));
     }
     console.error('[user-prefs] POST error:', err);
     captureSilentError(err, buildSentryContext(err, msg, {
@@ -307,7 +381,7 @@ export default async function handler(
       expectedSyncVersion: body.expectedSyncVersion,
       blobSize: body.data !== undefined ? JSON.stringify(body.data).length : 0,
     }));
-    return jsonResponse({ error: 'Failed to save preferences' }, 500, cors);
+    return finish(jsonResponse({ error: 'Failed to save preferences' }, 500, cors));
   }
 }
 

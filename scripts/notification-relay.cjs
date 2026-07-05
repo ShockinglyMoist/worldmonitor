@@ -2,9 +2,13 @@
 
 const { createHash } = require('node:crypto');
 const dns = require('node:dns').promises;
-const { ConvexHttpClient } = require('convex/browser');
 const { Resend } = require('resend');
 const { decrypt } = require('./lib/crypto.cjs');
+const {
+  assertNotificationWebhookDeliveryUrlSafe,
+  isBlockedResolvedAddress,
+  postJsonWithPinnedAddress,
+} = require('./lib/notification-webhook-ssrf.cjs');
 const { callLLM } = require('./lib/llm-chain.cjs');
 const { fetchUserPreferences, extractUserContext, formatUserProfile } = require('./lib/user-context.cjs');
 const { countryNameToIso2 } = require('./shared/country-name-to-iso2.cjs');
@@ -30,8 +34,22 @@ if (!UPSTASH_URL || !UPSTASH_TOKEN) { console.error('[relay] UPSTASH_REDIS_REST_
 if (!CONVEX_URL) { console.error('[relay] CONVEX_URL not set'); process.exit(1); }
 if (!RELAY_SECRET) { console.error('[relay] RELAY_SHARED_SECRET not set'); process.exit(1); }
 
-const convex = new ConvexHttpClient(CONVEX_URL);
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+
+// Fetch all enabled alertRules via the shared-secret /relay/enabled-rules
+// action. The underlying `alertRules.getByEnabled` is an internalQuery
+// (GHSA-r649-4cqj-w93h) — unreachable via ConvexHttpClient — so we go through
+// the HTTP action, mirroring the other /relay/* service calls. Throws on
+// non-2xx so callers keep their existing try/catch (fail-closed: deliver
+// nothing rather than fan out on a stale/partial rule set).
+async function fetchEnabledRules(enabled = true) {
+  const res = await fetch(`${CONVEX_SITE_URL}/relay/enabled-rules?enabled=${enabled}`, {
+    headers: { Authorization: `Bearer ${RELAY_SECRET}`, 'User-Agent': 'worldmonitor-relay/1.0' },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`enabled-rules HTTP ${res.status}`);
+  return await res.json();
+}
 
 // ── Upstash REST helpers ──────────────────────────────────────────────────────
 
@@ -161,7 +179,7 @@ async function isUserPro(userId) {
 // ── Private IP guard ─────────────────────────────────────────────────────────
 
 function isPrivateIP(ip) {
-  return /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|::1|fc|fd)/.test(ip);
+  return isBlockedResolvedAddress(ip);
 }
 
 // ── Quiet hours ───────────────────────────────────────────────────────────────
@@ -271,7 +289,7 @@ async function drainBatchOnWake() {
   if (!QUIET_HOURS_BATCH_ENABLED) return;
   let allRules;
   try {
-    allRules = await convex.query('alertRules:getByEnabled', { enabled: true });
+    allRules = await fetchEnabledRules(true);
   } catch (err) {
     console.warn('[relay] drainBatchOnWake: failed to fetch rules:', err.message);
     return;
@@ -291,11 +309,12 @@ async function processFlushQuietHeld(event) {
   const { userId, variant = 'full' } = event;
   if (!userId) return;
   console.log(`[relay] flush_quiet_held for ${userId} (${variant})`);
-  // Use the same public query the relay already calls in processEvent.
-  // internalQuery functions are unreachable via ConvexHttpClient.
+  // Fetch enabled rules via the shared-secret /relay/enabled-rules action —
+  // getByEnabled is an internalQuery (GHSA-r649-4cqj-w93h), unreachable via
+  // ConvexHttpClient.
   let allowedChannels = null;
   try {
-    const allRules = await convex.query('alertRules:getByEnabled', { enabled: true });
+    const allRules = await fetchEnabledRules(true);
     const rule = Array.isArray(allRules)
       ? allRules.find(r => r.userId === userId && (r.variant ?? 'full') === variant)
       : null;
@@ -486,28 +505,12 @@ async function sendWebhook(userId, webhookEnvelope, event) {
     return false;
   }
 
-  let parsed;
+  let safeUrl;
+  let resolvedAddresses;
   try {
-    parsed = new URL(url);
-  } catch {
-    console.warn(`[relay] Webhook invalid URL for ${userId}`);
-    await deactivateChannel(userId, 'webhook');
-    return false;
-  }
-
-  if (parsed.protocol !== 'https:') {
-    console.warn(`[relay] Webhook rejected non-HTTPS for ${userId}`);
-    return false;
-  }
-
-  try {
-    const addrs = await dns.resolve4(parsed.hostname);
-    if (addrs.some(isPrivateIP)) {
-      console.warn(`[relay] Webhook SSRF blocked (private IP) for ${userId}`);
-      return false;
-    }
+    ({ url: safeUrl, resolvedAddresses } = await assertNotificationWebhookDeliveryUrlSafe(url));
   } catch (err) {
-    console.warn(`[relay] Webhook DNS resolve failed for ${userId}:`, err.message);
+    console.warn(`[relay] Webhook URL rejected for ${userId}:`, err.message);
     return false;
   }
 
@@ -527,12 +530,12 @@ async function sendWebhook(userId, webhookEnvelope, event) {
   });
 
   try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'worldmonitor-relay/1.0' },
-      body: payload,
-      signal: AbortSignal.timeout(10000),
-    });
+    const resp = await postJsonWithPinnedAddress(
+      safeUrl,
+      payload,
+      { 'Content-Type': 'application/json', 'User-Agent': 'worldmonitor-relay/1.0' },
+      resolvedAddresses,
+    );
     if (resp.status === 404 || resp.status === 410 || resp.status === 403) {
       console.warn(`[relay] Webhook ${resp.status} for ${userId} — deactivating`);
       await deactivateChannel(userId, 'webhook');
@@ -669,6 +672,15 @@ function normalizeEventCountryCode(raw) {
   return countryNameToIso2(raw);
 }
 
+const UNATTRIBUTED_GLOBAL_EVENT_TYPES = new Set([
+  'corridor_risk',
+  'shipping_stress',
+]);
+
+function isUnattributedGlobalEvent(event) {
+  return UNATTRIBUTED_GLOBAL_EVENT_TYPES.has(event?.eventType);
+}
+
 /**
  * Score-gated dispatch decision.
  *
@@ -692,20 +704,18 @@ function normalizeEventCountryCode(raw) {
  * `payload.countryCode`, ais-relay sometimes uses `payload.country`, browser-
  * submitted rss_alert events occasionally lift `country` to the event root.
  *
- * PERMISSIVE semantics for unattributed events: when a rule has
- * countries=['US'] and an event has NO country attribution, we deliver it.
- * The publisher didn't give us enough information to filter, so the user
- * receives a global alert that may or may not be about their country.
+ * Known-global semantics for unattributed events: when a rule has
+ * countries=['US'] and a known global event has NO country attribution, do not
+ * deliver it. A populated country scope means "only alerts matching my
+ * selected countries"; delivering global Corridor Risk / Shipping Stress alerts
+ * to a Ukraine/Romania-scoped user is worse than omitting those unscoped alerts.
  *
- * RATIONALE: most publishers today (rss_alert, ais-relay generic events,
- * etc.) do not emit a country code. Strict drop-on-missing semantics would
- * deliver ZERO alerts to a user who set countries=['US'] — strictly worse
- * UX than "occasional unscoped global event slips through." A user opting
- * into country-scope expects to receive AT LEAST events from those
- * countries; permissive delivery on unattributed events meets that
- * expectation. As publishers add country attribution (planned follow-up
- * audit), scoped delivery tightens automatically. A future strict-mode
- * opt-in (e.g. rule.countriesStrict=true) is left to a follow-up UI surface.
+ * RATIONALE: the UI copy says "Restrict alerts to specific countries" and
+ * users now rely on it to narrow noisy global feeds. RSS publishers still lack
+ * reliable country attribution, so they stay permissive until attribution is
+ * available; otherwise a scoped user would lose keyword-relevant news alerts.
+ * Publishers that know a country must emit `payload.countryCode` or
+ * `payload.country` to reach scoped rules reliably.
  *
  * Strict semantics still apply when the event IS attributed but doesn't
  * match: rule.countries=['US'] + event.payload.countryCode='IR' → drop.
@@ -714,8 +724,7 @@ function normalizeEventCountryCode(raw) {
  * matching. Known malformed values emitted by current publishers (for
  * example 'USA', 'United States', 'UAE') are mapped to ISO2 and filtered
  * strictly. Unknown malformed values fall through to the "unattributed"
- * branch and are delivered permissively — the publisher emitted garbage,
- * treat it as if it emitted nothing.
+ * branch and are dropped only for known-global events.
  */
 function eventMatchesCountryScope(event, rule) {
   // Empty/absent countries on the rule → all events (no filter applied).
@@ -727,14 +736,15 @@ function eventMatchesCountryScope(event, rule) {
     ?? event?.country
     ?? null;
 
-  // Unattributed → PERMISSIVE deliver (see RATIONALE above).
+  // Unattributed -> drop only known global/noisy events; keep RSS permissive
+  // until publishers provide reliable country attribution.
   if (typeof eventCountry !== 'string' || eventCountry.trim().length === 0) {
-    return true;
+    return !isUnattributedGlobalEvent(event);
   }
 
   const normalized = normalizeEventCountryCode(eventCountry);
-  // Unknown malformed value → treat as unattributed → PERMISSIVE deliver.
-  if (normalized === null) return true;
+  // Unknown malformed value -> treat as unattributed.
+  if (normalized === null) return !isUnattributedGlobalEvent(event);
 
   return rule.countries.includes(normalized);
 }
@@ -1001,7 +1011,7 @@ async function processEvent(event) {
 
   let enabledRules;
   try {
-    enabledRules = await convex.query('alertRules:getByEnabled', { enabled: true });
+    enabledRules = await fetchEnabledRules(true);
   } catch (err) {
     console.error('[relay] Failed to fetch alert rules:', err.message);
     return;

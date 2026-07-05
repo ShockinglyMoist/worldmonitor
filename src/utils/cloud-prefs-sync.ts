@@ -20,9 +20,18 @@ import {
   applyMigrationChain,
   buildMigrations,
   mergeCloudWithLocalDirty,
+  parsePersistedDirtyKeys,
   settledDirtyKeys,
 } from './cloud-prefs-migrations';
+import {
+  isTemporaryCloudPrefsStatus,
+  parseRetryAfterSeconds,
+  rearmTemporaryCloudPrefsRetry,
+} from './cloud-prefs-retry';
+import { applyObservableCloudPrefsFlushSuccess } from './cloud-prefs-flush';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
+export { isTemporaryCloudPrefsStatus, parseRetryAfterSeconds } from './cloud-prefs-retry';
 
 
 const ENABLED = import.meta.env.VITE_CLOUD_PREFS_ENABLED === 'true';
@@ -37,6 +46,7 @@ const KEY_SYNC_VERSION = 'wm-cloud-sync-version';
 const KEY_LAST_SYNC_AT = 'wm-last-sync-at';
 const KEY_SYNC_STATE = 'wm-cloud-sync-state';
 const KEY_LAST_SIGNED_IN_AS = 'wm-last-signed-in-as';
+const KEY_DIRTY_KEYS = 'wm-cloud-prefs-dirty-keys';
 // Tracks the schema version of the LOCAL blob (i.e. what's in localStorage
 // right now). Distinct from the cloud row's schemaVersion. Required because
 // uploads can post local data without first fetching cloud (uploadNow,
@@ -84,6 +94,42 @@ let _cachedToken: string | null = null; // synchronous token cache for flush()
 // install() setItem/removeItem patch records them; a clean upload clears the
 // SETTLED ones. See resolveConflictWithMerge + mergeCloudWithLocalDirty.
 const _dirtyKeys = new Set<CloudSyncKey>();
+let _dirtyKeysUserId: string | null = null;
+
+function persistDirtyKeys(): void {
+  try {
+    if (_dirtyKeys.size === 0) {
+      Storage.prototype.removeItem.call(localStorage, KEY_DIRTY_KEYS);
+      return;
+    }
+    if (!_dirtyKeysUserId) return;
+    Storage.prototype.setItem.call(localStorage, KEY_DIRTY_KEYS, JSON.stringify({
+      userId: _dirtyKeysUserId,
+      keys: [..._dirtyKeys],
+    }));
+  } catch {
+    // localStorage unavailable: keep the in-memory guard for this page view.
+  }
+}
+
+function hydrateDirtyKeysFromStorage(userId: string): void {
+  try {
+    _dirtyKeys.clear();
+    _dirtyKeysUserId = userId;
+    const raw = localStorage.getItem(KEY_DIRTY_KEYS);
+    for (const key of parsePersistedDirtyKeys(raw, CLOUD_SYNC_KEYS, userId)) {
+      _dirtyKeys.add(key as CloudSyncKey);
+    }
+    if (raw !== null && _dirtyKeys.size === 0) persistDirtyKeys();
+  } catch {
+    // localStorage unavailable: the in-memory set remains the best effort.
+  }
+}
+
+function markDirtyKey(key: CloudSyncKey): void {
+  _dirtyKeys.add(key);
+  persistDirtyKeys();
+}
 
 /**
  * Clear dirty keys that a just-succeeded upload actually durably synced —
@@ -99,9 +145,11 @@ const _dirtyKeys = new Set<CloudSyncKey>();
  * current local value.
  */
 function clearSettledDirtyKeys(postedBlob: Record<string, string>): void {
+  let changed = false;
   for (const key of settledDirtyKeys(postedBlob, buildCloudBlob(), _dirtyKeys)) {
-    _dirtyKeys.delete(key as CloudSyncKey);
+    changed = _dirtyKeys.delete(key as CloudSyncKey) || changed;
   }
+  if (changed) persistDirtyKeys();
 }
 
 // ── 503 retry tracking ───────────────────────────────────────────────────────
@@ -308,47 +356,6 @@ export class ServiceUnavailableError extends Error {
   }
 }
 
-// Bounds on the Retry-After value we'll honor. Lower bound prevents a
-// retry storm if the server sends 0 or a malformed value; upper bound
-// caps the delay so a misconfigured/extreme header doesn't strand sync
-// for minutes.
-const RETRY_AFTER_MIN_SEC = 1;
-const RETRY_AFTER_MAX_SEC = 60;
-const RETRY_AFTER_DEFAULT_SEC = 5;
-
-export function isTemporaryCloudPrefsStatus(status: number): boolean {
-  return status === 429 || status === 503;
-}
-
-/**
- * Parse the `Retry-After` header per RFC 7231: either delta-seconds or an
- * HTTP-date. Returns a clamped number of seconds, with the configured
- * default for missing/malformed values. Exported for testability.
- */
-export function parseRetryAfterSeconds(headers: Headers): number {
-  const raw = headers.get('Retry-After');
-  if (!raw) return RETRY_AFTER_DEFAULT_SEC;
-  const trimmed = raw.trim();
-  // delta-seconds form: digits only.
-  if (/^\d+$/.test(trimmed)) {
-    const n = Number(trimmed);
-    if (!Number.isFinite(n)) return RETRY_AFTER_DEFAULT_SEC;
-    return Math.min(Math.max(n, RETRY_AFTER_MIN_SEC), RETRY_AFTER_MAX_SEC);
-  }
-  // HTTP-date form: parse and convert to delta-seconds from now.
-  // `Date.parse` is permissive — `Date.parse("-5")` parses as year -5 BCE,
-  // and other garbage strings can produce finite timestamps that then
-  // clamp to RETRY_AFTER_MIN_SEC, retrying in 1s instead of the safer
-  // default. Require the input to look like a real HTTP-date (must
-  // contain both a 4-digit year and a `:` time separator) so non-date
-  // garbage falls into the default-seconds branch instead.
-  if (!/\b\d{4}\b/.test(trimmed) || !trimmed.includes(':')) return RETRY_AFTER_DEFAULT_SEC;
-  const t = Date.parse(trimmed);
-  if (!Number.isFinite(t)) return RETRY_AFTER_DEFAULT_SEC;
-  const delta = Math.round((t - Date.now()) / 1000);
-  return Math.min(Math.max(delta, RETRY_AFTER_MIN_SEC), RETRY_AFTER_MAX_SEC);
-}
-
 async function fetchCloudPrefs(token: string, variant: string): Promise<CloudPrefs | null> {
   const res = await fetch(`/api/user-prefs?variant=${encodeURIComponent(variant)}`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -401,7 +408,7 @@ async function postCloudPrefs(
  * the post body — silently discarding the edit the user had just made (e.g. a
  * watchlist typed seconds earlier, then lost on the debounced upload's 409).
  */
-async function resolveConflictWithMerge(token: string, variant: string): Promise<boolean> {
+async function resolveConflictWithMerge(token: string, variant: string, callerGeneration: number): Promise<boolean> {
   const fresh = await fetchCloudPrefs(token, variant);
   if (!fresh) {
     setState('error');
@@ -417,6 +424,11 @@ async function resolveConflictWithMerge(token: string, variant: string): Promise
     setState('conflict');
     return false;
   }
+  // Generation guard (same vector as uploadNow's success branch): if the
+  // signed-in user switched during the awaits above, do not clear/persist
+  // settled dirty keys — _dirtyKeys now belongs to another user and the
+  // write would durably corrupt their persisted dirty-key entry.
+  if (_authGeneration !== callerGeneration) return false;
   setSyncVersion(retry.syncVersion);
   clearSettledDirtyKeys(merged);
   Storage.prototype.setItem.call(localStorage, KEY_LAST_SYNC_AT, String(Date.now()));
@@ -434,6 +446,7 @@ export async function onSignIn(userId: string, variant: string): Promise<void> {
   clearRetryTimer();
   _authGeneration += 1;
   const myGeneration = _authGeneration;
+  hydrateDirtyKeysFromStorage(userId);
 
   _currentVariant = variant;
   setState('syncing');
@@ -489,7 +502,7 @@ export async function onSignIn(userId: string, variant: string): Promise<void> {
         // Merge instead of clobber — see resolveConflictWithMerge. The old
         // path here applied the cloud blob over localStorage and stopped,
         // discarding the local edits this branch was trying to upload.
-        await resolveConflictWithMerge(token, variant);
+        await resolveConflictWithMerge(token, variant, myGeneration);
       } else {
         setSyncVersion(result.syncVersion);
         clearSettledDirtyKeys(blob);
@@ -558,6 +571,8 @@ export function onSignOut(): void {
   // Dirty-key tracking is per-user session state — drop it so edits made by
   // the next signed-in user don't merge against the prior user's pending set.
   _dirtyKeys.clear();
+  persistDirtyKeys();
+  _dirtyKeysUserId = null;
 
   // Preserve prefs; only clear sync metadata
   localStorage.removeItem(KEY_SYNC_VERSION);
@@ -591,8 +606,15 @@ async function uploadNow(variant: string): Promise<void> {
       // of overwriting localStorage with cloud (the old path did
       // applyCloudBlob(cloud) then re-posted buildCloudBlob() — which by then
       // WAS the cloud blob, so the user's just-made edit was silently lost).
-      await resolveConflictWithMerge(token, variant);
+      await resolveConflictWithMerge(token, variant, myGeneration);
     } else {
+      // Generation guard: a sign-out / account-switch during the awaits above
+      // repoints _dirtyKeys and _dirtyKeysUserId to a different user. Clearing
+      // (and now persisting) settled keys here would durably corrupt that
+      // user's dirty-key entry using this upload's stale postedBlob. Match the
+      // 503 retry branch and the flush-success path — bail if the generation
+      // moved.
+      if (_authGeneration !== myGeneration) return;
       setSyncVersion(result.syncVersion);
       clearSettledDirtyKeys(postedBlob);
       Storage.prototype.setItem.call(localStorage, KEY_LAST_SYNC_AT, String(Date.now()));
@@ -671,7 +693,7 @@ export function install(variant: string): void {
   Storage.prototype.setItem = function setItem(key: string, value: string) {
     originalSetItem.call(this, key, value);
     if (this === localStorage && !_suppressPatch && CLOUD_SYNC_KEYS.includes(key as CloudSyncKey)) {
-      _dirtyKeys.add(key as CloudSyncKey);
+      markDirtyKey(key as CloudSyncKey);
       schedulePrefUpload(_currentVariant);
     }
   };
@@ -680,7 +702,7 @@ export function install(variant: string): void {
   Storage.prototype.removeItem = function removeItem(key: string) {
     originalRemoveItem.call(this, key);
     if (this === localStorage && !_suppressPatch && CLOUD_SYNC_KEYS.includes(key as CloudSyncKey)) {
-      _dirtyKeys.add(key as CloudSyncKey);
+      markDirtyKey(key as CloudSyncKey);
       schedulePrefUpload(_currentVariant);
     }
   };
@@ -730,27 +752,41 @@ export function install(variant: string): void {
       // the new version when the response is observable (true unloads never
       // get here; the next boot's onSignIn GET heals those instead).
       //
-      // Non-2xx (409/5xx): change nothing — keeping the stale version and
-      // the dirty keys is what routes the next upload through the
-      // conflict-merge path, which is the correct recovery.
-      if (!res.ok) return;
+      // Non-2xx: 409 keeps the stale version and dirty keys so the next
+      // upload resolves through the conflict-merge path. Temporary 429/5xx
+      // responses are observable during tab switches, so re-arm the normal
+      // retry machinery instead of stranding the final save.
+      if (!res.ok) {
+        rearmTemporaryCloudPrefsRetry({
+          status: res.status,
+          headers: res.headers,
+          myGeneration,
+          getAuthGeneration: () => _authGeneration,
+          setPending: () => setState('pending'),
+          clearRetryTimer,
+          setRetryTimer: (timer) => { _retryTimer = timer; },
+          uploadNow: () => uploadNow(_currentVariant),
+        });
+        return;
+      }
       const body = (await res.json().catch(() => null)) as { syncVersion?: number } | null;
-      if (typeof body?.syncVersion !== 'number') return;
-      // Auth generation: a sign-out or user switch while the flush was in
-      // flight already cleared/replaced sync state — don't resurrect a
-      // version marker for the previous session.
-      if (_authGeneration !== myGeneration) return;
-      // Monotonic: a slow flush response must not regress the version past
-      // a newer upload (or conflict-merge) that completed meanwhile.
-      if (body.syncVersion <= getSyncVersion()) return;
-      setSyncVersion(body.syncVersion);
-      clearSettledDirtyKeys(blob);
-      Storage.prototype.setItem.call(localStorage, KEY_LAST_SYNC_AT, String(Date.now()));
-      // Only claim 'synced' when no newer edit re-armed the debounce AND no
-      // uploadNow is mid-flight (the debounce callback nulls the timer
-      // synchronously before uploadNow's async work, so the timer alone
-      // can't distinguish "idle" from "upload in progress").
-      if (_debounceTimer === null && _uploadsInFlight === 0) setState('synced');
+      applyObservableCloudPrefsFlushSuccess({
+        syncVersion: body?.syncVersion,
+        myGeneration,
+        getAuthGeneration: () => _authGeneration,
+        getSyncVersion,
+        setSyncVersion,
+        clearSettledDirtyKeys: () => clearSettledDirtyKeys(blob),
+        setLastSyncAt: (timestampMs) => {
+          Storage.prototype.setItem.call(localStorage, KEY_LAST_SYNC_AT, String(timestampMs));
+        },
+        // Only claim 'synced' when no newer edit re-armed the debounce AND no
+        // uploadNow is mid-flight (the debounce callback nulls the timer
+        // synchronously before uploadNow's async work, so the timer alone
+        // can't distinguish "idle" from "upload in progress").
+        isIdle: () => _debounceTimer === null && _uploadsInFlight === 0,
+        setSynced: () => setState('synced'),
+      });
     }).catch(() => { /* best-effort on unload */ });
   };
 

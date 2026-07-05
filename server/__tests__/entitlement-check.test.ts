@@ -61,6 +61,7 @@ function makeEntitlements(tier: number, planKey = "free") {
 
 describe("gateway entitlement check", () => {
   test.each([
+    "/api/intelligence/v1/classify-event",
     "/api/market/v1/analyze-stock",
     "/api/market/v1/get-stock-analysis-history",
     "/api/market/v1/backtest-stock",
@@ -97,6 +98,17 @@ describe("gateway entitlement check", () => {
     const body = await result!.json();
     expect(body.error).toBe("Unable to verify entitlements");
     expect(body.requiredTier).toBe(1);
+  });
+
+  test("checkEntitlement accepts Clerk role=pro for tier-1 gates without Convex entitlements", async () => {
+    const result = await checkEntitlement(
+      "test-user",
+      "/api/market/v1/analyze-stock",
+      {},
+      { clerkRole: "pro" },
+    );
+
+    expect(result).toBeNull();
   });
 
   test("checkEntitlement returns 403 for insufficient tier", async () => {

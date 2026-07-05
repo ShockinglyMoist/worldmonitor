@@ -4,10 +4,12 @@ import {
   categoryOf,
   normalizeCompleteEvents,
   pickRendererMainThread,
+  selectRendererMainThreadEvents,
   computeSelfTimeByName,
   categorize,
   buildDecomposition,
   buildReport,
+  waitForTraceComplete,
 } from '../scripts/measure-desktop-mainthread.mjs';
 
 // Deterministic fixture (CI-safe, no browser): a CrRendererMain thread (1:1) with
@@ -80,6 +82,19 @@ test('pickRendererMainThread scores normalized B/E events and skips null entries
   assert.equal(pickRendererMainThread(fixtureBeginEndTraceEvents()), '1:1');
 });
 
+test('selectRendererMainThreadEvents returns the selected normalized thread events (#4539)', () => {
+  const { mainThread, completeEvents } = selectRendererMainThreadEvents(fixtureBeginEndTraceEvents());
+
+  assert.equal(mainThread, '1:1');
+  assert.deepEqual(
+    completeEvents.map((event) => ({ name: event.name, dur: event.dur, thread: `${event.pid}:${event.tid}` })),
+    [
+      { name: 'Layout', dur: 150, thread: '1:1' },
+      { name: 'RunTask', dur: 500, thread: '1:1' },
+    ],
+  );
+});
+
 test('computeSelfTimeByName subtracts nested children from parents (#4539)', () => {
   const main = normalizeCompleteEvents(fixtureTraceEvents()).filter((e) => `${e.pid}:${e.tid}` === '1:1');
   const { byName, total } = computeSelfTimeByName(main);
@@ -138,6 +153,26 @@ test('self-time handles ts-tie parent/child and adjacent siblings (guards the du
   assert.equal(byName.get('Layout'), 40, 'ts-tie child keeps its full duration');
   assert.equal(byName.get('Paint'), 60, 'adjacent sibling is not nested under Layout');
   assert.equal(total, 100);
+});
+
+test("waitForTraceComplete abort removes listener and rejects promptly (#4443)", async () => {
+  const listeners = new Set();
+  const client = {
+    once(name, callback) {
+      if (name === "Tracing.tracingComplete") listeners.add(callback);
+    },
+    off(name, callback) {
+      if (name === "Tracing.tracingComplete") listeners.delete(callback);
+    },
+  };
+  const controller = new AbortController();
+  const promise = waitForTraceComplete(client, 1000, { signal: controller.signal });
+
+  assert.equal(listeners.size, 1);
+  controller.abort();
+
+  await assert.rejects(promise, /Cancelled waiting for Tracing.tracingComplete/);
+  assert.equal(listeners.size, 0);
 });
 
 test('buildReport refuses to attribute when no CrRendererMain thread exists (#4539)', () => {

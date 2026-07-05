@@ -38,6 +38,13 @@
       "removal_issue": null
     },
     {
+      "path": "api/mcp/error-fingerprint.ts",
+      "category": "external-protocol",
+      "reason": "MCP Sentry grouping helper for tools/call capture sites. Keeps MCP external-protocol failures grouped by step, tool, and stable inner error signature without introducing a sebuf product API.",
+      "owner": "@SebastienMelki",
+      "removal_issue": null
+    },
+    {
       "path": "api/mcp/registry/cache-tools.ts",
       "category": "external-protocol",
       "reason": "MCP TOOL_REGISTRY cache-tool entries (no _execute). Extracted from api/mcp.ts during the structural split; same external-protocol constraint as the parent shim.",
@@ -131,7 +138,7 @@
     {
       "path": "api/mcp/resources/index.ts",
       "category": "external-protocol",
-      "reason": "MCP RESOURCE_REGISTRY + buildResourceResponse + resources/list public-shape projection. Read-only addressable URIs surfaced via resources/list + resources/read JSON-RPC methods, shape dictated by the MCP spec. Routes resources/read through dispatchToolsCall for auth-symmetric Pro daily-quota deduction.",
+      "reason": "MCP resource registries (PUBLIC_RESOURCE_REGISTRY + TEMPLATE_RESOURCE_REGISTRY) + buildResourceResponse/buildPublicResourceResponse + resources/list + resources/templates/list public-shape projections. Read-only addressable URIs surfaced via the resources/list, resources/templates/list, and resources/read JSON-RPC methods, shape dictated by the MCP spec. Concrete public resources (metadata-only freshness probes) read anonymously + quota-free; data-bearing template instantiations route resources/read through dispatchToolsCall for auth-symmetric Pro daily-quota deduction.",
       "owner": "@SebastienMelki",
       "removal_issue": null
     },
@@ -139,6 +146,20 @@
       "path": "api/mcp/resources/slugs.ts",
       "category": "external-protocol",
       "reason": "Hand-curated kebab-case slug → matcher table for the worldmonitor://chokepoints/{slug}/status MCP resource URI. The stability contract: bookmarked URIs survive cache refreshes / upstream renames. Same external-protocol constraint as the resources index it backs.",
+      "owner": "@SebastienMelki",
+      "removal_issue": null
+    },
+    {
+      "path": "api/mcp/ui/registry.ts",
+      "category": "external-protocol",
+      "reason": "MCP Apps (extension io.modelcontextprotocol/ui) ui:// resource registry + buildUiResourceRead + resources/list public-shape projection. Serves static, data-free HTML app shells whose shape is dictated by the MCP Apps spec (mimeType text/html;profile=mcp-app); linked from tools via _meta.ui.resourceUri. Same external-protocol constraint as the sibling resources/index.ts.",
+      "owner": "@SebastienMelki",
+      "removal_issue": null
+    },
+    {
+      "path": "api/mcp/ui/country-risk-app.ts",
+      "category": "external-protocol",
+      "reason": "MCP Apps (io.modelcontextprotocol/ui) self-contained HTML app shell served verbatim as the ui://worldmonitor/country-risk.html resource. Exports an HTML string constant (no HTTP handler); the postMessage bridge protocol is dictated by the MCP Apps spec. Same external-protocol constraint as the ui/registry.ts it backs.",
       "owner": "@SebastienMelki",
       "removal_issue": null
     },
@@ -181,6 +202,13 @@
       "path": "api/oauth-protected-resource.ts",
       "category": "external-protocol",
       "reason": "RFC 9728 OAuth Protected Resource metadata. Dynamic per-host to satisfy scanner origin-match rules — shape dictated by RFC 9728.",
+      "owner": "@SebastienMelki",
+      "removal_issue": null
+    },
+    {
+      "path": "api/oauth-authorization-server.ts",
+      "category": "external-protocol",
+      "reason": "RFC 8414 OAuth Authorization Server metadata + WorkOS auth.md agent_auth block. Dynamic per-host so issuer/endpoints match the request origin and align with the host-derived RFC 9728 PRM — shape dictated by RFC 8414 / workos.com/auth-md.",
       "owner": "@SebastienMelki",
       "removal_issue": null
     },
@@ -324,6 +352,20 @@
       "path": "api/version.js",
       "category": "ops-admin",
       "reason": "Build-version probe for the desktop auto-updater. Tiny plain-JSON operator plumbing.",
+      "owner": "@SebastienMelki",
+      "removal_issue": null
+    },
+    {
+      "path": "api/not-found.ts",
+      "category": "ops-admin",
+      "reason": "Structured JSON 404 responder for unmatched /api/* paths (mounted by api/[...notfound].ts). Fixed-shape error envelope for agents/scanners in place of Vercel's native text/plain NOT_FOUND; not a product API.",
+      "owner": "@SebastienMelki",
+      "removal_issue": null
+    },
+    {
+      "path": "api/[...notfound].ts",
+      "category": "ops-admin",
+      "reason": "Filesystem catch-all mount for api/not-found.ts. Exists solely to preserve the structured JSON 404 for genuinely unmatched /api/* paths without using an afterFiles rewrite that can shadow dynamic sebuf gateways; not a product API.",
       "owner": "@SebastienMelki",
       "removal_issue": null
     },

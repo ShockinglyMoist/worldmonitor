@@ -70,6 +70,10 @@ export type RequestReason =
   // Distinct from auth_401 so telemetry separates malformed requests
   // from auth failures.
   | 'malformed_request'
+  // Fail-closed rejection when the internal-MCP replay-nonce cache (Redis)
+  // is unavailable so an atomic claim can't be made. Distinct from auth_401
+  // so a Redis outage is not conflated with genuine signature/auth failures.
+  | 'replay_cache_unavailable'
   | 'unknown_route'
   | 'method_not_allowed'
   | 'cors_error'
@@ -79,7 +83,14 @@ export type RequestReason =
   | 'rl_min_429'
   | 'rl_ceiling_429'
   | 'rl_min_shadow'
-  | 'rl_ceiling_shadow';
+  | 'rl_ceiling_shadow'
+  // Idempotency-Key (server/_shared/idempotency.ts): a malformed key (400), a
+  // replayed response, an in-flight duplicate (409), or a key reused with a
+  // different body (422).
+  | 'idempotency_invalid'
+  | 'idempotent_replay'
+  | 'idempotency_conflict'
+  | 'idempotency_mismatch';
 
 export interface RequestEvent {
   _time: string;

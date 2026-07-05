@@ -16,7 +16,7 @@ const middlewareSource = readFileSync(resolve(__dirname, '../middleware.ts'), 'u
 const dockerfileSource = readFileSync(resolve(__dirname, '../Dockerfile'), 'utf-8');
 const dockerNginxSource = readFileSync(resolve(__dirname, '../docker/nginx.conf'), 'utf-8');
 const frontendDockerfileSource = readFileSync(resolve(__dirname, '../docker/Dockerfile'), 'utf-8');
-const SPA_HTML_CACHE_SOURCE = '/((?!api|mcp|oauth|assets|blog|docs|embed|embed\\.html|favico|map-styles|data|textures|pro|sw\\.js|workbox-[a-f0-9]+\\.js|manifest\\.webmanifest|offline\\.html|robots\\.txt|sitemap\\.xml|llms\\.txt|llms-full\\.txt|openapi\\.yaml|\\.well-known|wm-widget-sandbox\\.html|mcp-grant\\.html|mcp-grant).*)';
+const SPA_HTML_CACHE_SOURCE = '/((?!api|mcp|oauth|assets|blog|docs|embed|embed\\.html|favico|map-styles|data|textures|pro|sw\\.js|workbox-[a-f0-9]+\\.js|manifest\\.webmanifest|offline\\.html|robots\\.txt|sitemap\\.xml|llms\\.txt|llms-full\\.txt|openapi\\.yaml|openapi\\.json|auth\\.md|\\.well-known|wm-widget-sandbox\\.html|mcp-grant\\.html|mcp-grant).*)';
 const GLOBAL_SECURITY_HEADER_SOURCE = '/((?!docs|embed|embed\\.html).*)';
 const APP_ROOT_HOST_PATTERN = '^(?:(?:www|tech|finance|commodity|happy|energy)\\.)?worldmonitor\\.app$';
 const GLOBAL_CSP_INLINE_SCRIPT_HTML_FILES = [
@@ -499,7 +499,7 @@ describe('docker runtime dependency guardrails', () => {
   const runtimeLock = JSON.parse(readFileSync(resolve(__dirname, '../docker/runtime-package-lock.json'), 'utf-8'));
 
   it('installs runtime node_modules from a minimal dependency stage', () => {
-    assert.match(dockerfileSource, /FROM node:22-alpine AS runtime-deps/);
+    assert.match(dockerfileSource, /^FROM\s+node:22-alpine@sha256:[a-f0-9]{64}\s+AS\s+runtime-deps$/m);
     assert.match(dockerfileSource, /npm ci --omit=dev --omit=optional --ignore-scripts/);
     assert.match(dockerfileSource, /COPY --from=runtime-deps \/app\/node_modules \.\/node_modules/);
     assert.doesNotMatch(dockerfileSource, /npm prune --omit=dev/);
@@ -1102,19 +1102,42 @@ describe('brief magazine CSP override', () => {
 //   (2) variant build scripts dropping the `npm run build:openapi`
 //       prefix and silently shipping web bundles without the spec;
 //   (3) the openapi source under docs/ being deleted without a
-//       matching removal of the build step.
+//       matching removal of the build step;
+//   (4) linkset[0] losing its RFC 9727 `item` enumeration (agent
+//       crawlers read the catalog anchor's item links to find every API).
 describe('agent readiness: api-catalog + openapi build', () => {
   const apiCatalog = JSON.parse(
     readFileSync(resolve(__dirname, '../public/.well-known/api-catalog'), 'utf-8')
   );
   const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf-8'));
 
-  it('api anchor is first and points at the api host root', () => {
-    assert.equal(apiCatalog.linkset[0].anchor, 'https://api.worldmonitor.app/');
+  const catalogEntry = apiCatalog.linkset[0];
+  const apiEntry = apiCatalog.linkset.find((entry) => entry.anchor === 'https://api.worldmonitor.app/');
+
+  it('linkset[0] is the catalog anchor and enumerates each API via RFC 9727 item links', () => {
+    assert.equal(catalogEntry.anchor, 'https://worldmonitor.app/.well-known/api-catalog');
+    assert.ok(Array.isArray(catalogEntry.item), 'linkset[0] must carry an "item" array (RFC 9727 §4)');
+    assert.ok(catalogEntry.item.length > 0, 'linkset[0].item must enumerate at least one API');
+    // Each item MUST resolve to a linkset context object that describes that API.
+    const anchors = new Set(apiCatalog.linkset.map((entry) => entry.anchor));
+    for (const item of catalogEntry.item) {
+      assert.ok(item.href, 'each item entry must carry an href');
+      assert.ok(
+        anchors.has(item.href),
+        `item href ${item.href} must match a linkset context anchor`
+      );
+    }
+    const itemHrefs = catalogEntry.item.map((i) => i.href);
+    assert.ok(itemHrefs.includes('https://api.worldmonitor.app/'), 'item list must enumerate the REST API host root');
+    assert.ok(itemHrefs.includes('https://worldmonitor.app/mcp'), 'item list must enumerate the MCP server');
+  });
+
+  it('the api host root has its own context object', () => {
+    assert.ok(apiEntry, 'linkset must contain a context object anchored at https://api.worldmonitor.app/');
   });
 
   it('status href points at /api/health (SPA lives at /health — would 200 HTML and look healthy)', () => {
-    const statusHref = apiCatalog.linkset[0].status[0].href;
+    const statusHref = apiEntry.status[0].href;
     assert.ok(
       statusHref.startsWith('https://api.worldmonitor.app'),
       `status href must be on api.worldmonitor.app, got: ${statusHref}`
@@ -1126,12 +1149,30 @@ describe('agent readiness: api-catalog + openapi build', () => {
   });
 
   it('service-desc points at /openapi.yaml with the OpenAPI media type', () => {
-    const serviceDesc = apiCatalog.linkset[0]['service-desc'][0];
+    const serviceDesc = apiEntry['service-desc'][0];
     assert.ok(
       serviceDesc.href.endsWith('/openapi.yaml'),
       `service-desc href must end with /openapi.yaml, got: ${serviceDesc.href}`
     );
     assert.equal(serviceDesc.type, 'application/vnd.oai.openapi');
+  });
+
+  it('also advertises a JSON service-desc at /openapi.json for JSON-only parsers', () => {
+    // Some agent-readiness scanners (ora.ai / orank) run the spec straight
+    // through a JSON parser; YAML input trips them ("found but failed to
+    // parse"). The JSON mirror is a second service-desc so those scanners
+    // have a parseable spec. YAML stays at [0] (human-readable canonical).
+    // Read from apiEntry (the api.worldmonitor.app context object), not
+    // linkset[0] — since #4691 added the RFC 9727 catalog anchor, linkset[0]
+    // is the catalog itself (item enumeration, no service-desc). The sibling
+    // /openapi.yaml assertion above already uses apiEntry for the same reason.
+    const jsonDesc = apiEntry['service-desc'][1];
+    assert.ok(jsonDesc, 'api anchor must have a second service-desc entry (JSON mirror)');
+    assert.ok(
+      jsonDesc.href.endsWith('/openapi.json'),
+      `second service-desc href must end with /openapi.json, got: ${jsonDesc.href}`
+    );
+    assert.equal(jsonDesc.type, 'application/json');
   });
 
   it('has a second anchor for the MCP server-card', () => {
@@ -1145,7 +1186,7 @@ describe('agent readiness: api-catalog + openapi build', () => {
     );
   });
 
-  it('exposes a build:openapi script that copies docs/api → public/openapi.yaml', () => {
+  it('exposes a build:openapi script that copies docs/api → public/openapi.yaml AND emits public/openapi.json', () => {
     const buildOpenapi = pkg.scripts['build:openapi'];
     assert.ok(buildOpenapi, 'package.json must define scripts["build:openapi"]');
     assert.ok(
@@ -1155,6 +1196,31 @@ describe('agent readiness: api-catalog + openapi build', () => {
     assert.ok(
       buildOpenapi.includes('public/openapi.yaml'),
       `build:openapi must write to public/openapi.yaml, got: ${buildOpenapi}`
+    );
+    // The JSON mirror (served at /openapi.json for JSON-only scanners) is
+    // generated by scripts/build-openapi-json.mjs in the same step.
+    assert.ok(
+      buildOpenapi.includes('build-openapi-json.mjs'),
+      `build:openapi must run scripts/build-openapi-json.mjs to emit public/openapi.json, got: ${buildOpenapi}`
+    );
+    assert.ok(
+      existsSync(resolve(__dirname, '../scripts/build-openapi-json.mjs')),
+      'scripts/build-openapi-json.mjs must exist'
+    );
+  });
+
+  it('SPA catch-all rewrite excludes /openapi.json so it serves the static JSON spec, not the app shell', () => {
+    const catchAll = vercelConfig.rewrites.find((r) =>
+      r.destination === DASHBOARD_HTML_DESTINATION && r.source.startsWith('/((?!')
+    );
+    assert.ok(catchAll, 'expected the SPA catch-all rewrite');
+    assert.ok(
+      catchAll.source.includes('openapi\\.json'),
+      'SPA catch-all must exclude openapi.json so /openapi.json serves the static spec'
+    );
+    assert.ok(
+      SPA_HTML_CACHE_SOURCE.includes('openapi\\.json'),
+      'HTML cache catch-all must exclude openapi.json'
     );
   });
 
@@ -1275,6 +1341,187 @@ describe('agent readiness: MCP/OAuth origin alignment', () => {
     assert.ok(rewrite, 'expected a rewrite for /.well-known/oauth-protected-resource');
     assert.equal(rewrite.destination, '/api/oauth-protected-resource');
   });
+
+  // RFC 8414 authorization-server metadata is ALSO a dynamic edge fn (was a
+  // static file at public/.well-known/oauth-authorization-server). Host
+  // derivation keeps `issuer` == the origin the PRM advertises, so ora.ai/orank
+  // can cross-check that PRM `authorization_servers` resolves to an AS document
+  // whose `issuer` matches — while same-origin also satisfies isitagentready.
+  it('oauth-authorization-server handler returns host-derived RFC 8414 metadata + WorkOS agent_auth block', async () => {
+    const mod = await import('../api/oauth-authorization-server.ts');
+    const handler = mod.default;
+    assert.equal(typeof handler, 'function', 'handler must be the default export');
+
+    const hosts = ['worldmonitor.app', 'www.worldmonitor.app', 'api.worldmonitor.app'];
+    for (const host of hosts) {
+      const req = new Request(`https://${host}/.well-known/oauth-authorization-server`, {
+        headers: { host },
+      });
+      const res = await handler(req);
+      assert.equal(res.status, 200, `status 200 for ${host}`);
+      assert.equal(res.headers.get('content-type'), 'application/json', `JSON for ${host}`);
+      assert.equal(res.headers.get('vary'), 'Host', `Vary: Host for ${host}`);
+      assert.equal(res.headers.get('cache-control'), 'public, max-age=3600', `cacheable for ${host}`);
+      const json = await res.json();
+
+      // RFC 8414 issuer + endpoints are all self-origin.
+      assert.equal(json.issuer, `https://${host}`, `issuer matches ${host}`);
+      assert.equal(json.authorization_endpoint, `https://${host}/oauth/authorize`);
+      assert.equal(json.token_endpoint, `https://${host}/oauth/token`);
+      assert.equal(json.registration_endpoint, `https://${host}/oauth/register`);
+      assert.deepEqual(json.code_challenge_methods_supported, ['S256']);
+      assert.deepEqual(json.token_endpoint_auth_methods_supported, ['none']);
+      assert.deepEqual(json.scopes_supported, ['mcp']);
+
+      // WorkOS auth.md agent_auth discovery block (only `anonymous` is honest —
+      // WM has no ID-JAG identity endpoint, so identity_assertion is not advertised).
+      assert.ok(json.agent_auth, `agent_auth block present for ${host}`);
+      assert.equal(json.agent_auth.skill, `https://${host}/auth.md`, `skill round-trips to /auth.md for ${host}`);
+      assert.equal(json.agent_auth.register_uri, `https://${host}/oauth/register`);
+      assert.deepEqual(json.agent_auth.identity_types_supported, ['anonymous']);
+      // Only `access_token` — an api_key is user-minted (carries a user
+      // identity), so it is not an anonymous-registration credential.
+      assert.deepEqual(
+        json.agent_auth.anonymous.credential_types_supported,
+        ['access_token'],
+        `anonymous sibling block enumerates credential types for ${host}`
+      );
+      // The anonymous registration method requires a claim URI (readiness
+      // scanners reject the method without it). Anonymous credentials are
+      // claimed at authorization time, so claim_uri == the authorization
+      // endpoint. Advertised both at the agent_auth top level (parallel to
+      // register_uri) and inside the anonymous method object.
+      assert.equal(
+        json.agent_auth.claim_uri,
+        `https://${host}/oauth/authorize`,
+        `agent_auth.claim_uri = authorization endpoint for ${host}`
+      );
+      assert.equal(
+        json.agent_auth.anonymous.claim_uri,
+        `https://${host}/oauth/authorize`,
+        `anonymous method advertises claim_uri for ${host}`
+      );
+    }
+  });
+
+  // The Host header is client-controlled; both discovery handlers derive their
+  // origin through the shared allowlist (api/_agent-metadata.ts) so a spoofed
+  // Host cannot be reflected into issuer/resource/endpoints. They also guard the
+  // HTTP method (read-only docs).
+  it('discovery handlers reject spoofed Host (apex fallback) and non-GET methods', async () => {
+    const prm = (await import('../api/oauth-protected-resource.ts')).default;
+    const as = (await import('../api/oauth-authorization-server.ts')).default;
+
+    // Spoofed / unrecognized Host → apex fallback, never reflected.
+    for (const host of ['evil.com', 'worldmonitor.app.evil.com', 'evilworldmonitor.app', 'x.y.worldmonitor.app']) {
+      const prmRes = await prm(new Request('https://worldmonitor.app/.well-known/oauth-protected-resource', { headers: { host } }));
+      const prmJson = await prmRes.json();
+      assert.equal(prmJson.resource, 'https://worldmonitor.app', `PRM must not reflect spoofed host ${host}`);
+      assert.deepEqual(prmJson.authorization_servers, ['https://worldmonitor.app']);
+
+      const asRes = await as(new Request('https://worldmonitor.app/.well-known/oauth-authorization-server', { headers: { host } }));
+      const asJson = await asRes.json();
+      assert.equal(asJson.issuer, 'https://worldmonitor.app', `AS must not reflect spoofed host ${host}`);
+      assert.equal(asJson.token_endpoint, 'https://worldmonitor.app/oauth/token', `AS token_endpoint must not carry spoofed host ${host}`);
+      assert.equal(asJson.agent_auth.register_uri, 'https://worldmonitor.app/oauth/register');
+      assert.equal(asJson.agent_auth.claim_uri, 'https://worldmonitor.app/oauth/authorize', `AS claim_uri must not carry spoofed host ${host}`);
+      assert.equal(asJson.agent_auth.anonymous.claim_uri, 'https://worldmonitor.app/oauth/authorize');
+    }
+
+    // Legit subdomain still self-describes.
+    const variant = await as(new Request('https://tech.worldmonitor.app/.well-known/oauth-authorization-server', { headers: { host: 'tech.worldmonitor.app' } }));
+    assert.equal((await variant.json()).issuer, 'https://tech.worldmonitor.app');
+
+    // Method guard: OPTIONS → 204 preflight, other verbs → 405 + Allow, GET → 200.
+    for (const handler of [prm, as]) {
+      const opt = await handler(new Request('https://worldmonitor.app/x', { method: 'OPTIONS', headers: { host: 'worldmonitor.app' } }));
+      assert.equal(opt.status, 204, 'OPTIONS is a CORS preflight');
+      assert.equal(opt.headers.get('access-control-allow-methods'), 'GET, HEAD, OPTIONS');
+
+      const post = await handler(new Request('https://worldmonitor.app/x', { method: 'POST', headers: { host: 'worldmonitor.app' } }));
+      assert.equal(post.status, 405, 'non-GET/HEAD is rejected');
+      assert.equal(post.headers.get('allow'), 'GET, HEAD, OPTIONS');
+
+      const get = await handler(new Request('https://worldmonitor.app/x', { headers: { host: 'worldmonitor.app' } }));
+      assert.equal(get.status, 200, 'GET is served');
+    }
+  });
+
+  it('vercel.json rewrites /.well-known/oauth-authorization-server to the edge fn and the static file is gone', () => {
+    const rewrite = vercelConfig.rewrites.find(
+      (r) => r.source === '/.well-known/oauth-authorization-server'
+    );
+    assert.ok(rewrite, 'expected a rewrite for /.well-known/oauth-authorization-server');
+    assert.equal(rewrite.destination, '/api/oauth-authorization-server');
+    // The static file MUST be deleted — Vercel serves real files before
+    // rewrites, so a leftover static doc would shadow the dynamic handler.
+    assert.ok(
+      !existsSync(resolve(__dirname, '../public/.well-known/oauth-authorization-server')),
+      'static public/.well-known/oauth-authorization-server must be removed so the edge fn is not shadowed'
+    );
+  });
+});
+
+// Agent readiness: a WorkOS-spec /auth.md walkthrough that agents can fetch to
+// learn the registration flow, cross-linked from the AS metadata agent_auth.skill.
+describe('agent readiness: auth.md walkthrough', () => {
+  const authMd = readFileSync(resolve(__dirname, '../public/auth.md'), 'utf-8');
+
+  it('publishes /auth.md with the WorkOS-prescribed sections', () => {
+    for (const heading of ['Discover', 'Pick a method', 'Register', 'Claim', 'Use the credential', 'Errors', 'Revocation']) {
+      assert.match(
+        authMd,
+        new RegExp(`^##\\s+${escapeRegExp(heading)}\\s*$`, 'm'),
+        `auth.md must have a "## ${heading}" section`
+      );
+    }
+  });
+
+  it('references the auth.md spec and carries the spec anchor keywords', () => {
+    assert.ok(authMd.includes('https://workos.com/auth-md'), 'auth.md must reference the WorkOS spec');
+    for (const keyword of ['agent_auth', 'register_uri', 'claim_uri', 'identity_assertion', 'id-jag', 'WWW-Authenticate']) {
+      assert.ok(authMd.includes(keyword), `auth.md must mention spec keyword: ${keyword}`);
+    }
+  });
+
+  it('keeps every section header within the scanner read budget (~5 KB truncation)', () => {
+    // isitagentready / ora.ai reads only the first ~5 KB of auth.md; any `## `
+    // section header past that byte offset is dropped and the section reported
+    // missing (regressing auth-md-structure). This has bitten us before, so
+    // guard with a conservative ceiling — an edit that bloats an earlier
+    // section fails HERE instead of silently regressing the live scan.
+    const HEADER_BUDGET = 4800;
+    let offset = 0;
+    for (const line of authMd.split('\n')) {
+      if (line.startsWith('## ')) {
+        assert.ok(
+          offset < HEADER_BUDGET,
+          `"${line.trim()}" starts at byte ${offset}; must be < ${HEADER_BUDGET} to survive the ~5 KB scanner truncation`
+        );
+      }
+      offset += Buffer.byteLength(line, 'utf8') + 1; // + the newline that split() dropped
+    }
+  });
+
+  it('advertises a register endpoint that resolves (matches the agent_auth register_uri path)', () => {
+    assert.match(
+      authMd,
+      /https:\/\/(?:api\.)?worldmonitor\.app\/oauth\/register/,
+      'auth.md must document the reachable /oauth/register endpoint so the discovery chain is not stale'
+    );
+  });
+
+  it('serves /auth.md as markdown and keeps it off the SPA catch-all', () => {
+    assert.equal(getHeaderValueForSource('/auth.md', 'Content-Type'), 'text/markdown; charset=utf-8');
+    assert.equal(getHeaderValueForSource('/auth.md', 'Access-Control-Allow-Origin'), '*');
+    // Excluded from the SPA catch-all rewrite + cache header (like openapi.json)
+    // so the real file is served instead of the dashboard HTML fallback.
+    const catchAll = vercelConfig.rewrites.find((r) =>
+      r.destination === DASHBOARD_HTML_DESTINATION && r.source.startsWith('/((?!')
+    );
+    assert.ok(catchAll.source.includes('|auth\\.md|'), 'SPA catch-all rewrite must exclude /auth.md');
+    assert.ok(SPA_HTML_CACHE_SOURCE.includes('|auth\\.md|'), 'HTML cache catch-all must exclude /auth.md');
+  });
 });
 
 // PR history: #3204 / #3206 forced the resvg linux-x64-gnu native
@@ -1347,12 +1594,28 @@ describe('agent readiness: homepage Link headers', () => {
         'mcp-server-card rel must carry anchor="/mcp"'
       );
 
-      // Target URIs must be root-relative (start with /, not http://)
+      // `service-desc` is advertised twice — the JSON spec (/openapi.json,
+      // parseable by JSON-only scanners like ora.ai/orank) first, then the
+      // human-readable YAML (/openapi.yaml). Both must be present.
+      assert.match(
+        linkHeader.value,
+        /<\/openapi\.json>; rel="service-desc"; type="application\/json"/,
+        'Link header must advertise /openapi.json as a JSON service-desc'
+      );
+      assert.match(
+        linkHeader.value,
+        /<\/openapi\.yaml>; rel="service-desc"; type="application\/vnd\.oai\.openapi"/,
+        'Link header must still advertise /openapi.yaml as the OpenAPI service-desc'
+      );
+
+      // Target URIs must be root-relative (start with /, not http://).
+      // One target per required rel, plus the extra /openapi.json service-desc
+      // (service-desc is the only rel advertised with two targets).
       const targetMatches = [...linkHeader.value.matchAll(/<([^>]+)>/g)];
       assert.strictEqual(
         targetMatches.length,
-        requiredRels.length,
-        `expected exactly ${requiredRels.length} link targets, got ${targetMatches.length}`
+        requiredRels.length + 1,
+        `expected exactly ${requiredRels.length + 1} link targets, got ${targetMatches.length}`
       );
       for (const [, target] of targetMatches) {
         assert.ok(

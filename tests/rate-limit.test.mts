@@ -11,6 +11,9 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import {
+  ENDPOINT_RATE_POLICIES,
+  FAIL_CLOSED_ENDPOINT_RATE_POLICY_REQUIRED,
+  GLOBAL_RATE_LIMIT_FALLBACK_READ_ROUTES,
   RATE_LIMIT_DEGRADED_HEADERS,
   UNKNOWN_CLIENT_IP,
   checkEndpointRateLimit,
@@ -39,11 +42,15 @@ async function importFreshRateLimitModule() {
 }
 
 describe('rate-limit getClientIp (#3531 — drop spoofable x-forwarded-for)', () => {
-  it('prefers cf-connecting-ip when Cloudflare is in front', () => {
+  afterEach(() => { delete process.env.CF_EDGE_PROOF_SECRET; });
+
+  it('prefers cf-connecting-ip when Cloudflare proof is present', () => {
+    process.env.CF_EDGE_PROOF_SECRET = 'edge-secret-xyz';
     const req = makeRequest({
       'cf-connecting-ip': '203.0.113.7',
       'x-real-ip': '192.0.2.5',
       'x-forwarded-for': '198.51.100.8',
+      'x-wm-edge-proof': 'edge-secret-xyz',
     });
     assert.equal(getClientIp(req), '203.0.113.7');
   });
@@ -71,6 +78,48 @@ describe('rate-limit getClientIp (#3531 — drop spoofable x-forwarded-for)', ()
   it('treats whitespace-only header values as absent', () => {
     const req = makeRequest({ 'cf-connecting-ip': '   ', 'x-real-ip': '192.0.2.5' });
     assert.equal(getClientIp(req), '192.0.2.5');
+  });
+});
+
+describe('rate-limit getClientIp — Cloudflare edge-proof (GHSA-c267)', () => {
+  afterEach(() => { delete process.env.CF_EDGE_PROOF_SECRET; });
+
+  it('unconfigured (no CF_EDGE_PROOF_SECRET): ignores cf-connecting-ip and uses x-real-ip', () => {
+    delete process.env.CF_EDGE_PROOF_SECRET;
+    const req = makeRequest({ 'cf-connecting-ip': '203.0.113.7', 'x-real-ip': '192.0.2.5' });
+    assert.equal(getClientIp(req), '192.0.2.5');
+  });
+
+  it('configured + valid proof header: trusts cf-connecting-ip', () => {
+    process.env.CF_EDGE_PROOF_SECRET = 'edge-secret-xyz';
+    const req = makeRequest({
+      'cf-connecting-ip': '203.0.113.7',
+      'x-real-ip': '192.0.2.5',
+      'x-wm-edge-proof': 'edge-secret-xyz',
+    });
+    assert.equal(getClientIp(req), '203.0.113.7');
+  });
+
+  it('configured + MISSING proof: ignores spoofable cf-connecting-ip, uses x-real-ip', () => {
+    process.env.CF_EDGE_PROOF_SECRET = 'edge-secret-xyz';
+    const req = makeRequest({ 'cf-connecting-ip': '203.0.113.7', 'x-real-ip': '192.0.2.5' });
+    assert.equal(getClientIp(req), '192.0.2.5');
+  });
+
+  it('configured + WRONG proof: ignores cf-connecting-ip, uses x-real-ip', () => {
+    process.env.CF_EDGE_PROOF_SECRET = 'edge-secret-xyz';
+    const req = makeRequest({
+      'cf-connecting-ip': '203.0.113.7',
+      'x-real-ip': '192.0.2.5',
+      'x-wm-edge-proof': 'wrong-secret',
+    });
+    assert.equal(getClientIp(req), '192.0.2.5');
+  });
+
+  it('configured + no proof + no x-real-ip: shared UNKNOWN bucket (spoofed cf-connecting-ip cannot rotate identities)', () => {
+    process.env.CF_EDGE_PROOF_SECRET = 'edge-secret-xyz';
+    const req = makeRequest({ 'cf-connecting-ip': '203.0.113.7' });
+    assert.equal(getClientIp(req), UNKNOWN_CLIENT_IP);
   });
 });
 
@@ -192,6 +241,67 @@ describe('rate-limit fail-open / fail-closed posture (#3531 M9)', () => {
     assert.equal(res.headers.get('X-RateLimit-Mode'), 'degraded');
   });
 
+  it('summarize-article is an explicit fail-closed endpoint policy route', async () => {
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    const mod = await importFreshRateLimitModule();
+    const pathname = '/api/news/v1/summarize-article';
+
+    assert.deepEqual(ENDPOINT_RATE_POLICIES[pathname], { limit: 30, window: '60 s' });
+    assert.ok(
+      pathname in FAIL_CLOSED_ENDPOINT_RATE_POLICY_REQUIRED,
+      'LLM-backed summarize-article must stay in the fail-closed requirement registry',
+    );
+
+    const res = await mod.checkEndpointRateLimit(
+      makeRequest({ 'cf-connecting-ip': '203.0.113.7' }),
+      pathname,
+      { 'Access-Control-Allow-Origin': 'https://worldmonitor.app' },
+    );
+
+    assert.ok(res, 'expected summarize-article endpoint policy to fail closed without Redis config');
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get('X-RateLimit-Mode'), 'degraded');
+    assert.equal(
+      res.headers.get('Access-Control-Allow-Origin'),
+      'https://worldmonitor.app',
+      'CORS headers should be propagated on the degraded response',
+    );
+    assert.equal(res.headers.get('Retry-After'), '5');
+  });
+
+  it('deduct-situation is an explicit fail-closed endpoint policy route (#4676)', async () => {
+    // LLM-backed situational deduction (imports callLlmReasoning) must fail
+    // closed on a Redis outage rather than inherit the availability-first
+    // global fallback — mirrors summarize-article / classify-event. Regression
+    // guard for the #4676 finding where it was absent from both registries.
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    const mod = await importFreshRateLimitModule();
+    const pathname = '/api/intelligence/v1/deduct-situation';
+
+    assert.deepEqual(ENDPOINT_RATE_POLICIES[pathname], { limit: 600, window: '60 s' });
+    assert.ok(
+      pathname in FAIL_CLOSED_ENDPOINT_RATE_POLICY_REQUIRED,
+      'LLM-backed deduct-situation must stay in the fail-closed requirement registry',
+    );
+
+    const res = await mod.checkEndpointRateLimit(
+      makeRequest({ 'cf-connecting-ip': '203.0.113.7' }),
+      pathname,
+      { 'Access-Control-Allow-Origin': 'https://worldmonitor.app' },
+    );
+
+    assert.ok(res, 'expected deduct-situation endpoint policy to fail closed without Redis config');
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get('X-RateLimit-Mode'), 'degraded');
+    assert.equal(
+      res.headers.get('Access-Control-Allow-Origin'),
+      'https://worldmonitor.app',
+      'CORS headers should be propagated on the degraded response',
+    );
+  });
+
   it('checkEndpointRateLimit keeps unrecognised paths unguarded even with fail-closed defaults', async () => {
     delete process.env.UPSTASH_REDIS_REST_URL;
     delete process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -204,6 +314,29 @@ describe('rate-limit fail-open / fail-closed posture (#3531 M9)', () => {
     );
 
     assert.equal(res, null);
+  });
+
+  it('documented read-only global fallback routes remain fail-open when Redis config is missing', async () => {
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    const mod = await importFreshRateLimitModule();
+    const pathname = '/api/aviation/v1/list-airport-delays';
+
+    assert.ok(
+      pathname in GLOBAL_RATE_LIMIT_FALLBACK_READ_ROUTES,
+      'the intentionally fail-open read route must be documented in the global fallback registry',
+    );
+    assert.equal(mod.hasEndpointRatePolicy(pathname), false);
+
+    const endpointRes = await mod.checkEndpointRateLimit(
+      makeRequest({ 'cf-connecting-ip': '203.0.113.7' }),
+      pathname,
+      {},
+    );
+    const globalRes = await mod.checkRateLimit(makeRequest({ 'cf-connecting-ip': '203.0.113.7' }), {});
+
+    assert.equal(endpointRes, null, 'no endpoint policy should be applied to the documented read route');
+    assert.equal(globalRes, null, 'global fallback keeps read traffic fail-open without Redis config');
   });
 
   it('server rate-limit degraded logs are also sent through Sentry capture', async () => {

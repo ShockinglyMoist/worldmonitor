@@ -124,7 +124,7 @@ describe(`live API cache/auth regression sweep (${LIVE ? 'ENABLED' : 'SKIPPED - 
     assertNoSentinelLeak(fake.bodyText, 'premium RPC fake auth');
   });
 
-  it('MCP OPTIONS and unauthenticated POST are protocol-valid no-store responses', async () => {
+  it('MCP OPTIONS, public discovery, and gated data method are protocol-valid no-store responses', async () => {
     const options = await fetchText(`${WEB_BASE}/mcp`, {
       method: 'OPTIONS',
       headers: {
@@ -136,7 +136,22 @@ describe(`live API cache/auth regression sweep (${LIVE ? 'ENABLED' : 'SKIPPED - 
     assert.match(options.resp.headers.get('access-control-allow-methods') || '', /\bPOST\b/);
     assertNoStore(options.resp, 'MCP OPTIONS');
 
-    const post = await fetchText(`${WEB_BASE}/mcp`, {
+    // A bare GET (no Last-Event-ID) is a client opening the OPTIONAL standalone
+    // server->client SSE stream. This stateless route offers none, so the MCP
+    // Streamable HTTP spec requires 405 (SDK clients treat it as the graceful
+    // "no standalone stream" signal). Returning 401 here surfaces to a strict
+    // client as `Failed to open SSE stream: Unauthorized` and is scored as a
+    // failed protocol handshake by agent-readiness scanners.
+    const bareGet = await fetchText(`${WEB_BASE}/mcp`, {
+      method: 'GET',
+      headers: { Accept: 'text/event-stream' },
+    });
+    assert.equal(bareGet.resp.status, 405, 'unauthenticated standalone SSE-stream open must be 405, never 401');
+    assert.match(bareGet.resp.headers.get('allow') || '', /\bPOST\b/, '405 must advertise Allow (RFC 9110 §15.5.6)');
+
+    // Discovery is public: unauthenticated `initialize` succeeds (200) and must
+    // still be no-store (the #4497 cached-200 hazard applies to any 200).
+    const discover = await fetchText(`${WEB_BASE}/mcp`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -153,9 +168,72 @@ describe(`live API cache/auth regression sweep (${LIVE ? 'ENABLED' : 'SKIPPED - 
         },
       }),
     });
+    assert.equal(discover.resp.status, 200, 'unauthenticated initialize is public discovery');
+    assertNoStore(discover.resp, 'MCP anonymous initialize');
+    assert.notEqual(cfCacheStatus(discover.resp).toUpperCase(), 'HIT', 'anonymous discovery 200 must not be a shared-cache HIT');
+
+    // resources/list is catalog-enumeration discovery (like tools/list): the
+    // `initialize` handshake advertises the `resources` capability, so an
+    // unauthenticated resources/list MUST return the catalog (orank's
+    // mcp-resource-listing check), not a 401.
+    const resourceList = await fetchText(`${WEB_BASE}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'resources/list', params: {} }),
+    });
+    assert.equal(resourceList.resp.status, 200, 'unauthenticated resources/list is public discovery');
+    assertNoStore(resourceList.resp, 'MCP anonymous resources/list');
+    const resourceBody = JSON.parse(resourceList.bodyText);
+    assert.ok(
+      Array.isArray(resourceBody.result?.resources) && resourceBody.result.resources.length >= 1,
+      'anonymous resources/list must enumerate a non-empty resource catalog',
+    );
+
+    // orank mcp-resource-quality: EVERY resources/list entry must resources/read
+    // cleanly for an anonymous caller. The catalog is now all concrete,
+    // metadata-only resources, so an anonymous resources/read of each must
+    // return a non-empty application/json content payload — not a 401.
+    for (const resource of resourceBody.result.resources) {
+      const read = await fetchText(`${WEB_BASE}/mcp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'resources/read', params: { uri: resource.uri } }),
+      });
+      assert.equal(read.resp.status, 200,
+        `anonymous resources/read ${resource.uri} must be public (orank mcp-resource-quality)`);
+      assertNoStore(read.resp, `MCP anonymous resources/read ${resource.uri}`);
+      const readBody = JSON.parse(read.bodyText);
+      assert.equal(readBody.error, undefined,
+        `anonymous resources/read ${resource.uri} must not error: ${JSON.stringify(readBody.error)}`);
+      const content = readBody.result?.contents?.[0];
+      assert.equal(content?.mimeType, 'application/json',
+        `resources/read ${resource.uri} must declare a valid mimeType`);
+      assert.ok(typeof content?.text === 'string' && content.text.length > 0,
+        `resources/read ${resource.uri} must return non-empty content`);
+      JSON.parse(content.text); // valid JSON for the declared mimeType
+    }
+
+    // A DATA/quota method stays gated: unauthenticated `tools/call` must be a
+    // no-store, dynamic 401 carrying the OAuth resource_metadata hint.
+    const post = await fetchText(`${WEB_BASE}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'get_market_data', arguments: {} },
+      }),
+    });
     assert.equal(post.resp.status, 401);
     assert.match(post.resp.headers.get('www-authenticate') || '', /resource_metadata=/);
-    assertNoStore(post.resp, 'MCP unauthenticated POST');
+    assertNoStore(post.resp, 'MCP unauthenticated data method');
 
     const body = JSON.parse(post.bodyText);
     assert.equal(body.error?.code, -32001);

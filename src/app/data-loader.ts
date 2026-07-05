@@ -28,20 +28,9 @@ import { INTEL_HOTSPOTS, CONFLICT_ZONES } from '@/config/geo';
 import { tokenizeForMatch, matchKeyword } from '@/utils/keyword-match';
 import { withTimeout } from '@/utils/with-timeout';
 import {
-  fetchMultipleStocks,
-  fetchCommodityQuotes,
-  fetchSectors,
-  warmCommodityCache,
-  warmSectorCache,
-  fetchCrypto,
-  fetchCryptoSectors,
-  fetchDefiTokens,
-  fetchAiTokens,
-  fetchOtherTokens,
   fetchPredictions,
   fetchEarthquakes,
   fetchWeatherAlerts,
-  fetchFredData,
   fetchInternetOutages,
   fetchTrafficAnomalies,
   fetchDdosAttacks,
@@ -49,11 +38,9 @@ import {
   fetchAisSignals,
   getAisStatus,
   isAisConfigured,
-  fetchCableActivity,
   fetchCableHealth,
   fetchProtestEvents,
   getProtestStatus,
-  fetchFlightDelays,
   fetchMilitaryFlights,
   fetchUSNIFleetReport,
   updateBaseline,
@@ -64,25 +51,6 @@ import {
   fetchGdeltTensions,
   fetchNaturalEvents,
   fetchRecentAwards,
-  fetchOilAnalytics,
-  fetchCrudeInventoriesRpc,
-  fetchNatGasStorageRpc,
-  getEuGasStorageData,
-  getOilStocksAnalysisData,
-  fetchLngVulnerability,
-  getEcbFxRatesData,
-  fetchBisData,
-  fetchBlsData,
-  fetchCyberThreats,
-  fetchTradeRestrictions,
-  fetchTariffTrends,
-  fetchTradeFlows,
-  fetchComtradeFlows,
-  fetchTradeBarriers,
-  fetchCustomsRevenue,
-  fetchShippingRates,
-  fetchChokepointStatus,
-  fetchCriticalMinerals,
   fetchSanctionsPressure,
   fetchRadiationWatch,
 } from '@/services';
@@ -200,7 +168,6 @@ import type { NewsItem as ProtoNewsItem, ThreatLevel as ProtoThreatLevel } from 
 import { fetchMarketImplications } from '@/services/market-implications';
 import { fetchDiseaseOutbreaks } from '@/services/disease-outbreaks';
 import { fetchSocialVelocity } from '@/services/social-velocity';
-import { fetchShippingStress } from '@/services/supply-chain';
 import { getTopActiveGeoHubs } from '@/services/geo-activity';
 // getTopActiveHubs is lazy-imported at its call sites (applyTechHubActivities) so
 // the tech-activity → tech-hub-index → ~62KB tech-geo chain stays off the eager
@@ -1798,6 +1765,35 @@ export class DataLoaderManager implements AppModule {
   }
 
   async loadMarkets(): Promise<void> {
+    // Method-scoped so all of loadMarkets' try blocks (stocks/sectors/commodities +
+    // crypto/defi/ai/other) see these; market is dynamic-imported off eager main.js (#4571).
+    // Guarded: loadMarkets must not reject (the init() watchlist handler calls it
+    // unguarded), so a chunk-load failure skips this cycle like the per-block catches do.
+    let marketMod: typeof import('@/services/market');
+    try {
+      marketMod = await import('@/services/market');
+    } catch (e) {
+      // Persistent failure mode: a stale-deploy chunk 404 would otherwise skip the
+      // whole markets/crypto/commodities cycle with no signal. Log so it's traceable,
+      // and mirror the downstream failure states before returning.
+      console.warn('[DataLoader] market chunk load failed', e);
+      this.ctx.statusPanel?.updateApi('Finnhub', { status: 'error' });
+      this.ctx.statusPanel?.updateApi('CoinGecko', { status: 'error' });
+      (this.ctx.panels['markets'] as MarketPanel | undefined)?.showRetrying(t('common.failedMarketData'));
+      (this.ctx.panels['heatmap'] as HeatmapPanel | undefined)?.showRetrying(t('common.failedSectorData'));
+      (this.ctx.panels['commodities'] as CommoditiesPanel | undefined)?.showRetrying(t('common.failedCommodities'));
+      (this.ctx.panels['energy-complex'] as EnergyComplexPanel | undefined)?.showRetrying(t('common.failedCommodities'));
+      (this.ctx.panels['crypto'] as CryptoPanel | undefined)?.showRetrying(t('common.failedCryptoData'));
+      (this.ctx.panels['crypto-heatmap'] as CryptoHeatmapPanel | undefined)?.showRetrying(t('common.failedCryptoData'));
+      (this.ctx.panels['defi-tokens'] as DefiTokensPanel | undefined)?.showRetrying(t('common.failedCryptoData'));
+      (this.ctx.panels['ai-tokens'] as AiTokensPanel | undefined)?.showRetrying(t('common.failedCryptoData'));
+      (this.ctx.panels['other-tokens'] as OtherTokensPanel | undefined)?.showRetrying(t('common.failedCryptoData'));
+      return;
+    }
+    const {
+      fetchMultipleStocks, fetchCommodityQuotes, fetchSectors, warmCommodityCache, warmSectorCache,
+      fetchCrypto, fetchCryptoSectors, fetchDefiTokens, fetchAiTokens, fetchOtherTokens,
+    } = marketMod;
     try {
       const customEntries = getMarketWatchlistEntries();
       const effectiveSymbols = (() => {
@@ -1970,6 +1966,7 @@ export class DataLoaderManager implements AppModule {
       // Load ECB FX rates for CommoditiesPanel FX tab
       if (commoditiesPanel) {
         try {
+          const { getEcbFxRatesData } = await import('@/services/economic');
           const fxResp = await getEcbFxRatesData();
           if (!fxResp.unavailable && fxResp.rates?.length) {
             const EUR_FX_ORDER = ['USD', 'GBP', 'JPY', 'CHF', 'CAD', 'CNY', 'AUD'];
@@ -2804,6 +2801,7 @@ export class DataLoaderManager implements AppModule {
     }
 
     try {
+      const { fetchCyberThreats } = await import('@/services/cyber');
       const threats = await fetchCyberThreats({ limit: 500, days: 14 });
       this.ctx.cyberThreatsCache = threats;
       this.ctx.map?.setCyberThreats(threats);
@@ -2913,6 +2911,7 @@ export class DataLoaderManager implements AppModule {
 
   async loadCableActivity(): Promise<void> {
     try {
+      const { fetchCableActivity } = await import('@/services/cable-activity');
       const activity = await fetchCableActivity();
       this.ctx.map?.setCableActivity(activity.advisories, activity.repairShips);
       const itemCount = activity.advisories.length + activity.repairShips.length;
@@ -3034,6 +3033,7 @@ export class DataLoaderManager implements AppModule {
 
   async loadFlightDelays(): Promise<void> {
     try {
+      const { fetchFlightDelays } = await import('@/services/aviation');
       const delays = await fetchFlightDelays();
       this.ctx.map?.setFlightDelays(delays);
       this.ctx.map?.setLayerReady('flights', delays.length > 0);
@@ -3186,6 +3186,7 @@ export class DataLoaderManager implements AppModule {
 
     try {
       economicPanel?.setLoading(true);
+      const { fetchFredData } = await import('@/services/economic');
       const data = await fetchFredData();
 
       const postInfo = getCircuitBreakerCooldownInfo('FRED Batch');
@@ -3218,6 +3219,10 @@ export class DataLoaderManager implements AppModule {
   async loadOilAnalytics(): Promise<void> {
     const energyPanel = this.ctx.panels['energy-complex'] as EnergyComplexPanel | undefined;
     try {
+      const {
+        fetchOilAnalytics, fetchCrudeInventoriesRpc, fetchNatGasStorageRpc,
+        getEuGasStorageData, getOilStocksAnalysisData, fetchLngVulnerability,
+      } = await import('@/services/economic');
       const [data, crudeResp, natGasResp, euGasResp, oilStocksResp] = await Promise.allSettled([
         fetchOilAnalytics(),
         fetchCrudeInventoriesRpc(),
@@ -3290,6 +3295,7 @@ export class DataLoaderManager implements AppModule {
   async loadBisData(): Promise<void> {
     const economicPanel = this.ctx.panels['economic'] as EconomicPanel;
     try {
+      const { fetchBisData } = await import('@/services/economic');
       const data = await fetchBisData();
       economicPanel?.updateBis(data);
       const hasData = data.policyRates?.length > 0;
@@ -3307,6 +3313,7 @@ export class DataLoaderManager implements AppModule {
   async loadBlsData(): Promise<void> {
     const economicPanel = this.ctx.panels['economic'] as EconomicPanel;
     try {
+      const { fetchBlsData } = await import('@/services/economic');
       const data = await fetchBlsData();
       if (data.length > 0) {
         economicPanel?.updateBls(data);
@@ -3331,6 +3338,10 @@ export class DataLoaderManager implements AppModule {
     if (!tradePanel) return;
 
     try {
+      const {
+        fetchTradeRestrictions, fetchTariffTrends, fetchTradeFlows,
+        fetchTradeBarriers, fetchCustomsRevenue, fetchComtradeFlows,
+      } = await import('@/services/trade');
       const [restrictions, tariffs, flows, barriers, revenue, comtrade] = await Promise.allSettled([
         fetchTradeRestrictions([], 50),
         fetchTariffTrends('840', '156', '', 10),
@@ -3380,6 +3391,9 @@ export class DataLoaderManager implements AppModule {
     if (!scPanel) return;
 
     try {
+      const {
+        fetchShippingRates, fetchChokepointStatus, fetchCriticalMinerals, fetchShippingStress,
+      } = await import('@/services/supply-chain');
       const [shipping, chokepoints, minerals, stress] = await Promise.allSettled([
         fetchShippingRates(),
         fetchChokepointStatus(),

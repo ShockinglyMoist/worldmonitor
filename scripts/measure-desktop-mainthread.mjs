@@ -149,6 +149,16 @@ export function normalizeCompleteEvents(events) {
  * the top frame is a known limitation). Returns "pid:tid" or null when none found.
  */
 export function pickRendererMainThread(events) {
+  return selectRendererMainThreadEvents(events).mainThread;
+}
+
+/**
+ * Identify the busiest CrRendererMain and return its already-normalized complete
+ * events. This keeps report builders from normalizing the same trace twice:
+ * thread_name metadata must be read from raw events, but self-time needs complete
+ * events filtered to one properly-nested renderer thread.
+ */
+export function selectRendererMainThreadEvents(events) {
   const list = Array.isArray(events) ? events : [];
   const candidates = new Set();
   for (const e of list) {
@@ -156,11 +166,14 @@ export function pickRendererMainThread(events) {
       candidates.add(`${e.pid}:${e.tid}`);
     }
   }
-  if (candidates.size === 0) return null;
+  if (candidates.size === 0) return { mainThread: null, completeEvents: [] };
   const durByThread = new Map();
+  const eventsByThread = new Map();
   for (const e of normalizeCompleteEvents(list)) {
     const key = `${e.pid}:${e.tid}`;
     if (!candidates.has(key)) continue;
+    if (!eventsByThread.has(key)) eventsByThread.set(key, []);
+    eventsByThread.get(key).push(e);
     if (typeof e.dur === 'number') durByThread.set(key, (durByThread.get(key) || 0) + e.dur);
   }
   let best = null;
@@ -168,7 +181,7 @@ export function pickRendererMainThread(events) {
   for (const [key, d] of durByThread) {
     if (d > bestDur) { bestDur = d; best = key; }
   }
-  return best;
+  return { mainThread: best, completeEvents: best ? eventsByThread.get(best) || [] : [] };
 }
 
 /**
@@ -276,7 +289,7 @@ export function parseArgs(argv) {
   return args;
 }
 
-const TRACE_CATEGORIES = [
+export const TRACE_CATEGORIES = [
   'devtools.timeline',
   'disabled-by-default-devtools.timeline',
   'disabled-by-default-devtools.timeline.frame',
@@ -288,7 +301,7 @@ const TRACE_CATEGORIES = [
 ];
 
 /** Read a CDP IO stream to completion, decoding base64 chunks when flagged. */
-async function readTraceStream(client, handle) {
+export async function readTraceStream(client, handle) {
   let data = '';
   let eof = false;
   while (!eof) {
@@ -300,18 +313,36 @@ async function readTraceStream(client, handle) {
   return data;
 }
 
-function waitForTraceComplete(client, timeoutMs = TRACE_COMPLETE_TIMEOUT_MS) {
+export function waitForTraceComplete(client, timeoutMs = TRACE_COMPLETE_TIMEOUT_MS, { signal } = {}) {
   return new Promise((resolve, reject) => {
     let timer;
-    const onComplete = (event) => {
+    let settled = false;
+    const cleanup = () => {
       clearTimeout(timer);
-      resolve(event);
+      if (typeof client.off === "function") client.off("Tracing.tracingComplete", onComplete);
+      signal?.removeEventListener?.("abort", onAbort);
     };
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const onComplete = (event) => {
+      settle(resolve, event);
+    };
+    const onAbort = () => {
+      settle(reject, new Error("Cancelled waiting for Tracing.tracingComplete"));
+    };
+    if (signal?.aborted) {
+      reject(new Error("Cancelled waiting for Tracing.tracingComplete"));
+      return;
+    }
     timer = setTimeout(() => {
-      if (typeof client.off === 'function') client.off('Tracing.tracingComplete', onComplete);
-      reject(new Error(`Timed out waiting ${timeoutMs}ms for Tracing.tracingComplete`));
+      settle(reject, new Error(`Timed out waiting ${timeoutMs}ms for Tracing.tracingComplete`));
     }, timeoutMs);
-    client.once('Tracing.tracingComplete', onComplete);
+    client.once("Tracing.tracingComplete", onComplete);
+    signal?.addEventListener?.("abort", onAbort, { once: true });
   });
 }
 
@@ -371,7 +402,7 @@ async function measure(url, { cpu = 1, settle = 15000 } = {}) {
 /** Build the structured report (pure — exported for tests). */
 export function buildReport(result) {
   const events = result?.trace?.traceEvents || (Array.isArray(result?.trace) ? result.trace : []);
-  const mainThread = pickRendererMainThread(events);
+  const { mainThread, completeEvents } = selectRendererMainThreadEvents(events);
   const longTasks = summarizeLongTasks(result?.longtasks);
   if (!mainThread) {
     // No CrRendererMain metadata - we cannot isolate one properly-nested thread.
@@ -389,8 +420,7 @@ export function buildReport(result) {
       warning: 'no CrRendererMain thread found in trace; not attributing',
     };
   }
-  const complete = normalizeCompleteEvents(events).filter((e) => `${e.pid}:${e.tid}` === mainThread);
-  const { byName } = computeSelfTimeByName(complete);
+  const { byName } = computeSelfTimeByName(completeEvents);
   return {
     url: result?.url,
     cpu: result?.cpu,

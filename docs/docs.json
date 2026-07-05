@@ -187,7 +187,8 @@
             "pages": [
               "agent-discovery",
               "mcp-quickstart",
-              "mcp-server",
+              "cli",
+              "mcp-overview",
               "mcp-tools-reference",
               "mcp-jmespath",
               "mcp-error-catalog",
@@ -213,6 +214,7 @@
               "authentication",
               "adding-endpoints",
               "api-key-deployment",
+              "releasing-cli",
               "release-packaging",
               "cors",
               "health-endpoints",
@@ -453,5 +455,11 @@
         ]
       }
     ]
-  }
+  },
+  "redirects": [
+    {
+      "source": "/mcp-server",
+      "destination": "/mcp-overview"
+    }
+  ]
 }
