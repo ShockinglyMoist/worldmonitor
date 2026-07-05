@@ -70,6 +70,25 @@ export interface EarningsBriefContext {
   upcomingCount: number;
 }
 
+/**
+ * Pure transform from raw earnings-calendar entries to the brief context
+ * (#4929 review: business logic must not live inside an RPC-coupled
+ * private collector). Returns undefined when there is nothing to say.
+ */
+export function buildEarningsBriefContext(
+  earnings: Array<{ symbol: string; date: string; hasActuals?: boolean; surpriseDirection?: string }>,
+  todayISO: string,
+): EarningsBriefContext | undefined {
+  const recent = earnings
+    .filter((entry) => entry.hasActuals && (entry.surpriseDirection === 'beat' || entry.surpriseDirection === 'miss'))
+    .sort((a, b) => (a.date < b.date ? 1 : -1))
+    .slice(0, 5)
+    .map((entry) => ({ symbol: entry.symbol, direction: entry.surpriseDirection as 'beat' | 'miss' }));
+  const upcomingCount = earnings.filter((entry) => entry.date >= todayISO && !entry.hasActuals).length;
+  if (recent.length === 0 && upcomingCount === 0) return undefined;
+  return { recent, upcomingCount };
+}
+
 export interface SectorBriefContext {
   topName: string;
   topChange: number;

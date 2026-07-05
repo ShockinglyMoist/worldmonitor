@@ -297,6 +297,11 @@ async function fetchEconomicCalendar() {
   );
 
   // #4922 (b): capture the PRINTS. Release calendars carry dates only;
+  // NOTE consumer scope: the RPC (get-economic-calendar.ts) reconstructs
+  // its proto response and does NOT forward recentPrints — it is a
+  // Redis-side block for seeders/ops until the proto gains a field
+  // (tracked in #4922). The user-visible win flows through the EVENT
+  // actual/previous fields, which the proto already carries.
   // the values live in series observations and land same-day. Publish a
   // recentPrints block (always useful to market-brief consumers) and fill
   // actual/previous on any in-window event whose print is out.

@@ -28,6 +28,16 @@ function parseObs(observation) {
   return Number.isFinite(value) ? { date: observation.date, value } : null;
 }
 
+/** Consecutive-period guard: pct_mom/diff_k compare ADJACENT periods; a
+ * missing month in between would silently mislabel a 2-month change as
+ * month-over-month (review finding). 45 days tolerates publication
+ * jitter on monthly series. */
+const MAX_ADJACENT_GAP_MS = 45 * 86400_000;
+function isAdjacent(newer, older) {
+  const gap = new Date(newer.date).getTime() - new Date(older.date).getTime();
+  return Number.isFinite(gap) && gap > 0 && gap <= MAX_ADJACENT_GAP_MS;
+}
+
 /**
  * @param {Array<{ date: string; value: string }>} observations DESC-sorted
  *   FRED observations (newest first).
@@ -36,38 +46,44 @@ function parseObs(observation) {
  *   Empty strings when there is not enough usable data.
  */
 export function computePrintValues(observations, transform) {
-  const usable = (Array.isArray(observations) ? observations : [])
-    .map(parseObs)
-    .filter(Boolean);
   const empty = { actual: '', previous: '', obsDate: '' };
-  if (usable.length === 0) return empty;
+  const raw = Array.isArray(observations) ? observations : [];
+  // The LEADING observation must be parseable — if the newest value is a
+  // '.' placeholder, the print is not out yet; do NOT fall back to an
+  // older row and present it as current (review finding).
+  const lead = parseObs(raw[0]);
+  if (!lead) return empty;
+  const usable = raw.map(parseObs).filter(Boolean);
 
+  // Values are UNITLESS — event.unit already carries '%'/'K' and the
+  // calendar renderer appends it; embedding the unit here double-renders.
   if (transform === 'direct') {
+    const prev = usable.length > 1 ? usable[1] : null;
     return {
-      actual: usable[0].value.toFixed(1),
-      previous: usable.length > 1 ? usable[1].value.toFixed(1) : '',
-      obsDate: usable[0].date,
+      actual: lead.value.toFixed(1),
+      previous: prev ? prev.value.toFixed(1) : '',
+      obsDate: lead.date,
     };
   }
+  if (usable.length < 2 || !isAdjacent(usable[0], usable[1])) return empty;
   if (transform === 'diff_k') {
-    if (usable.length < 2) return empty;
     const actual = usable[0].value - usable[1].value;
-    const previous = usable.length > 2 ? usable[1].value - usable[2].value : null;
+    const hasPrev = usable.length > 2 && isAdjacent(usable[1], usable[2]);
+    const previous = hasPrev ? usable[1].value - usable[2].value : null;
     return {
-      actual: `${actual >= 0 ? '+' : ''}${Math.round(actual)}K`,
-      previous: previous === null ? '' : `${previous >= 0 ? '+' : ''}${Math.round(previous)}K`,
+      actual: `${actual >= 0 ? '+' : ''}${Math.round(actual)}`,
+      previous: previous === null ? '' : `${previous >= 0 ? '+' : ''}${Math.round(previous)}`,
       obsDate: usable[0].date,
     };
   }
   // pct_mom
-  if (usable.length < 2 || usable[1].value === 0) return empty;
+  if (usable[1].value === 0) return empty;
   const actual = (usable[0].value / usable[1].value - 1) * 100;
-  const previous = usable.length > 2 && usable[2].value !== 0
-    ? (usable[1].value / usable[2].value - 1) * 100
-    : null;
+  const hasPrev = usable.length > 2 && isAdjacent(usable[1], usable[2]) && usable[2].value !== 0;
+  const previous = hasPrev ? (usable[1].value / usable[2].value - 1) * 100 : null;
   return {
-    actual: `${actual >= 0 ? '+' : ''}${actual.toFixed(1)}%`,
-    previous: previous === null ? '' : `${previous >= 0 ? '+' : ''}${previous.toFixed(1)}%`,
+    actual: `${actual >= 0 ? '+' : ''}${actual.toFixed(1)}`,
+    previous: previous === null ? '' : `${previous >= 0 ? '+' : ''}${previous.toFixed(1)}`,
     obsDate: usable[0].date,
   };
 }

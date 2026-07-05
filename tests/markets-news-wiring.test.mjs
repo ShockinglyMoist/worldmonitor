@@ -21,8 +21,8 @@ describe('computePrintValues (#4922b)', () => {
       { date: '2026-04-01', value: '319.9' },
     ];
     const out = computePrintValues(obs, 'pct_mom');
-    assert.equal(out.actual, '+0.4%');
-    assert.equal(out.previous, '+0.1%');
+    assert.equal(out.actual, '+0.4', 'unitless — event.unit carries the % (double-render fix)');
+    assert.equal(out.previous, '+0.1');
     assert.equal(out.obsDate, '2026-06-01');
   });
 
@@ -33,8 +33,8 @@ describe('computePrintValues (#4922b)', () => {
       { date: '2026-04-01', value: '159305' },
     ];
     const out = computePrintValues(obs, 'diff_k');
-    assert.equal(out.actual, '+222K');
-    assert.equal(out.previous, '-115K');
+    assert.equal(out.actual, '+222', 'unitless — event.unit carries the K');
+    assert.equal(out.previous, '-115');
   });
 
   it('direct: headline % series passes through', () => {
@@ -50,6 +50,30 @@ describe('computePrintValues (#4922b)', () => {
     assert.equal(computePrintValues([{ date: '2026-06-01', value: '.' }], 'pct_mom').actual, '');
     assert.equal(computePrintValues([{ date: '2026-06-01', value: '321.5' }], 'pct_mom').actual, '');
     assert.equal(computePrintValues([], 'direct').actual, '');
+  });
+
+  it("a '.' LEADING observation never falls back to an older row as 'current'", () => {
+    const out = computePrintValues([
+      { date: '2026-06-01', value: '.' },
+      { date: '2026-05-01', value: '320.2' },
+      { date: '2026-04-01', value: '319.9' },
+    ], 'pct_mom');
+    assert.equal(out.actual, '', 'print not out yet — must not present the prior month as current');
+  });
+
+  it('a mid-series month gap rejects the pair instead of mislabeling a 2-month change', () => {
+    const out = computePrintValues([
+      { date: '2026-06-01', value: '321.5' },
+      { date: '2026-03-01', value: '318.0' },
+    ], 'pct_mom');
+    assert.equal(out.actual, '', 'non-adjacent periods must not compute as MoM');
+  });
+
+  it('EVENT_SERIES keys stay in lockstep with FRED_RELEASES event names', async () => {
+    const src = readSrc('scripts/seed-economic-calendar.mjs');
+    for (const eventName of Object.keys(EVENT_SERIES)) {
+      assert.ok(src.includes(`event: '${eventName}'`), `FRED_RELEASES must contain '${eventName}' — the maps correlate by name`);
+    }
   });
 
   it('every mapped event has a series and transform', () => {
@@ -119,5 +143,76 @@ describe('wiring (source-textual)', () => {
     const loader = readSrc('src/app/data-loader.ts');
     assert.match(loader, /_collectEarningsContext/);
     assert.match(loader, /listEarningsCalendar\(\{/);
+  });
+});
+
+// ── #4929 review-round additions ───────────────────────────────────────────
+
+import { buildEarningsBriefContext } from '../src/services/daily-market-brief.ts';
+import { selectTopStories } from '../scripts/_clustering.mjs';
+
+describe('buildEarningsBriefContext (pure, #4929 review)', () => {
+  const TODAY = '2026-07-06';
+  const entries = [
+    { symbol: 'MSFT', date: '2026-07-03', hasActuals: true, surpriseDirection: 'beat' },
+    { symbol: 'TSLA', date: '2026-07-05', hasActuals: true, surpriseDirection: 'miss' },
+    { symbol: 'ORCL', date: '2026-07-01', hasActuals: true, surpriseDirection: '' },
+    { symbol: 'AAPL', date: '2026-07-10', hasActuals: false },
+    { symbol: 'NVDA', date: '2026-07-12', hasActuals: false },
+  ];
+
+  it('collects recent beats/misses newest-first and counts upcoming', () => {
+    const out = buildEarningsBriefContext(entries, TODAY);
+    assert.ok(out);
+    assert.deepEqual(out.recent.map((r) => r.symbol), ['TSLA', 'MSFT'], 'no-surprise reporters excluded');
+    assert.equal(out.upcomingCount, 2);
+  });
+
+  it('returns undefined when there is nothing to say', () => {
+    assert.equal(buildEarningsBriefContext([], TODAY), undefined);
+    assert.equal(buildEarningsBriefContext([{ symbol: 'X', date: '2026-06-01', hasActuals: true, surpriseDirection: '' }], TODAY), undefined);
+  });
+});
+
+describe('earnings context in the brief prompt (#4929 review)', () => {
+  it('renders the earnings block into geoContext and is stable across rebuilds', async () => {
+    const { buildDailyMarketBrief } = await import('../src/services/daily-market-brief.ts');
+    const captured = [];
+    const opts = {
+      markets: [{ symbol: 'AAPL', name: 'Apple', display: 'AAPL', price: 212, change: 1.0 }],
+      newsByCategory: { markets: [{ source: 'Reuters', title: 'Apple extends gains after strong outlook', link: 'https://x', pubDate: new Date('2026-07-06T01:00:00Z'), isAlert: false }] },
+      timezone: 'UTC',
+      now: new Date('2026-07-06T10:30:00.000Z'),
+      earningsContext: { recent: [{ symbol: 'MSFT', direction: 'beat' }, { symbol: 'TSLA', direction: 'miss' }], upcomingCount: 12 },
+      summarize: async (_h, _p, geoContext) => {
+        captured.push(geoContext ?? '');
+        return { summary: 'A stable-enough one liner for the earnings capture test.', provider: 't', model: 't', cached: false };
+      },
+    };
+    await buildDailyMarketBrief(opts);
+    await buildDailyMarketBrief(opts);
+    assert.match(captured[0], /Earnings: MSFT beat, TSLA miss/);
+    assert.match(captured[0], /Upcoming earnings \(14d\): 12/);
+    assert.equal(captured[1], captured[0], 'earnings block must not churn the cache identity across rebuilds');
+  });
+});
+
+describe('selectTopStories opts pass-through (#4929 review)', () => {
+  it('demoteFinance:false changes the ranking through the selection path', () => {
+    const finance = {
+      primaryTitle: 'Startup CEO announces record quarterly revenue and IPO plans today',
+      primarySource: 'TechCrunch', primaryLink: 'https://t/1',
+      pubDate: new Date().toISOString(), sources: ['TechCrunch', 'The Verge'], isAlert: true, tier: 2,
+    };
+    const geo = {
+      primaryTitle: 'Border clashes escalate along disputed frontier region overnight',
+      primarySource: 'Reuters', primaryLink: 'https://r/2',
+      pubDate: new Date().toISOString(), sources: ['Reuters', 'BBC'], isAlert: true, tier: 2,
+    };
+    const demoted = selectTopStories([finance, geo], 8);
+    const neutral = selectTopStories([finance, geo], 8, undefined, { demoteFinance: false });
+    const dScore = demoted.find((s) => s.primarySource === 'TechCrunch').importanceScore;
+    const nScore = neutral.find((s) => s.primarySource === 'TechCrunch').importanceScore;
+    assert.ok(nScore > dScore, 'opts must thread through selectTopStories to scoreImportance');
   });
 });

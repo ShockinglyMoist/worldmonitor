@@ -2260,15 +2260,8 @@ export class DataLoaderManager implements AppModule {
       });
       const earnings = resp.earnings ?? [];
       if (resp.unavailable || earnings.length === 0) return undefined;
-      const todayISO = today.toISOString().slice(0, 10);
-      const recent = earnings
-        .filter((entry) => entry.hasActuals && (entry.surpriseDirection === 'beat' || entry.surpriseDirection === 'miss'))
-        .sort((a, b) => (a.date < b.date ? 1 : -1))
-        .slice(0, 5)
-        .map((entry) => ({ symbol: entry.symbol, direction: entry.surpriseDirection as 'beat' | 'miss' }));
-      const upcomingCount = earnings.filter((entry) => entry.date >= todayISO && !entry.hasActuals).length;
-      if (recent.length === 0 && upcomingCount === 0) return undefined;
-      return { recent, upcomingCount };
+      const { buildEarningsBriefContext } = await import('@/services/daily-market-brief');
+      return buildEarningsBriefContext(earnings, today.toISOString().slice(0, 10));
     } catch {
       return undefined;
     }
