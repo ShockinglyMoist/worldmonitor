@@ -6,7 +6,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-exec docker run --rm --network host \
+# --init: tini as PID1 reaps the `timeout` children run-seeders.sh spawns,
+# otherwise they linger as zombies for the length of the run and trip the
+# host's process monitoring.
+exec docker run --rm --init --network host \
   -v "$PWD:/app" -w /app \
   --entrypoint sh \
   node:24-alpine scripts/run-seeders.sh

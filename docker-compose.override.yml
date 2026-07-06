@@ -1,5 +1,5 @@
-# Homelab overrides (gitignored). Secrets + local conventions live here so the
-# tracked compose file stays identical to upstream.
+# Homelab overrides (committed on the homelab branch — no secret values here;
+# secrets live in the gitignored .env).
 services:
   worldmonitor:
     ports: !override
@@ -9,12 +9,22 @@ services:
     environment:
       RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?set in .env}"
       # LLM / data keys go here when added (see SELF_HOSTING.md "API Keys")
+    # Upstream healthcheck is broken for self-hosting: `localhost` resolves to
+    # ::1 (nginx is IPv4-only) and /api/health 401s without an operator API
+    # key. Probe the SPA root over IPv4 instead.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:8080/ || exit 1"]
+    # Drop the ais-relay dependency — the relay is profile-gated below until an
+    # AISSTREAM_API_KEY exists (it refuses to run without one).
+    depends_on: !override
+      redis-rest:
+        condition: service_started
 
   ais-relay:
-    # Crashloops without AISSTREAM_API_KEY (free key: https://aisstream.io).
-    # Vessel tracking is disabled until the key is added to .env — then set
-    # this back to unless-stopped.
-    restart: "no"
+    # Requires AISSTREAM_API_KEY (free key: https://aisstream.io). Profile-gated
+    # so it isn't created at all until the key lands in .env; vessel tracking is
+    # off until then. Enable with: docker compose --profile ais up -d
+    profiles: ["ais"]
     security_opt:
       - no-new-privileges:true
     environment:
