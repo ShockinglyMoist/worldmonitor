@@ -1,0 +1,29 @@
+# Homelab overrides (gitignored). Secrets + local conventions live here so the
+# tracked compose file stays identical to upstream.
+services:
+  worldmonitor:
+    ports: !override
+      - "127.0.0.1:3002:8080"
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?set in .env}"
+      # LLM / data keys go here when added (see SELF_HOSTING.md "API Keys")
+
+  ais-relay:
+    # Crashloops without AISSTREAM_API_KEY (free key: https://aisstream.io).
+    # Vessel tracking is disabled until the key is added to .env — then set
+    # this back to unless-stopped.
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?set in .env}"
+
+  redis:
+    security_opt:
+      - no-new-privileges:true
+
+  redis-rest:
+    security_opt:
+      - no-new-privileges:true
