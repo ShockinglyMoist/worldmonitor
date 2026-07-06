@@ -53,6 +53,12 @@ const ALLOWED_COMMANDS = new Set([
   'PUBLISH', 'SUBSCRIBE',
   'SETNX', 'SETEX', 'PSETEX', 'GETSET',
   'APPEND', 'STRLEN',
+  // @upstash/ratelimit drives its sliding window with server-side Lua
+  // (SCRIPT LOAD + EVALSHA, EVAL fallback). Blocking these breaks
+  // /api/wm-session (fail-closed limiter) and with it every session-authed
+  // route. The proxy is loopback-only and bearer-token authed, so Lua here
+  // carries no more risk than the commands above.
+  'EVAL', 'EVALSHA', 'SCRIPT',
 ]);
 
 async function runCommand(args) {
