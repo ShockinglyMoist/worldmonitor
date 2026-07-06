@@ -144,6 +144,19 @@ async function resolveDnsJson(hostname, recordType) {
 async function defaultResolveHostname(hostname) {
   const resolveHostnameForTest = getResolveHostnameForTest();
   if (resolveHostnameForTest) return resolveHostnameForTest(hostname);
+  // Homelab: prefer the runtime's own resolver (Node, in the Docker sidecar).
+  // The hardcoded DoH endpoint (cloudflare-dns.com) is blackholed to 0.0.0.0 by
+  // the homelab's anti-DoH DNSBL, so the DoH path fails and every added MCP
+  // server was rejected "Invalid serverUrl". The system resolver reaches
+  // OPNsense, which resolves public targets normally (only public DoH providers
+  // are blocked, not the MCP hosts), and the SSRF check below still runs on the
+  // returned IPs. Falls back to DoH where node:dns is unavailable (Vercel edge).
+  try {
+    const { promises: dns } = await import('node:dns');
+    const settled = await Promise.allSettled([dns.resolve4(hostname), dns.resolve6(hostname)]);
+    const addrs = settled.flatMap((r) => (r.status === 'fulfilled' ? r.value : []));
+    if (addrs.length) return addrs;
+  } catch { /* node:dns unavailable (edge runtime) — fall through to DoH */ }
   const records = await Promise.all([
     resolveDnsJson(hostname, 'A'),
     resolveDnsJson(hostname, 'AAAA'),
