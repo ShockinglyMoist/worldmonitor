@@ -49,31 +49,41 @@ export async function fetchAcledCached(opts: FetchAcledOptions): Promise<AcledRa
   if (!token) return [];
 
   const cacheKey = `acled:shared:${opts.eventTypes}:${opts.startDate}:${opts.endDate}:${opts.country || 'all'}:${opts.limit || 500}`;
-  const result = await cachedFetchJson<AcledRawEvent[]>(cacheKey, ACLED_CACHE_TTL, async () => {
-    const params = new URLSearchParams({
-      event_type: opts.eventTypes,
-      event_date: `${opts.startDate}|${opts.endDate}`,
-      event_date_where: 'BETWEEN',
-      limit: String(opts.limit || 500),
-      _format: 'json',
+  try {
+    const result = await cachedFetchJson<AcledRawEvent[]>(cacheKey, ACLED_CACHE_TTL, async () => {
+      const params = new URLSearchParams({
+        event_type: opts.eventTypes,
+        event_date: `${opts.startDate}|${opts.endDate}`,
+        event_date_where: 'BETWEEN',
+        limit: String(opts.limit || 500),
+        _format: 'json',
+      });
+      if (opts.country) params.set('country', opts.country);
+
+      const resp = await fetch(`${ACLED_API_URL}?${params}`, {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+          'User-Agent': CHROME_UA,
+        },
+        signal: AbortSignal.timeout(ACLED_TIMEOUT_MS),
+      });
+
+      if (!resp.ok) throw new Error(`ACLED API error: ${resp.status}`);
+      const data = (await resp.json()) as { data?: AcledRawEvent[]; message?: string; error?: string };
+      if (data.message || data.error) throw new Error(data.message || data.error || 'ACLED API error');
+
+      const events = data.data || [];
+      return events.length > 0 ? events : null;
     });
-    if (opts.country) params.set('country', opts.country);
-
-    const resp = await fetch(`${ACLED_API_URL}?${params}`, {
-      headers: {
-        Accept: 'application/json',
-        Authorization: `Bearer ${token}`,
-        'User-Agent': CHROME_UA,
-      },
-      signal: AbortSignal.timeout(ACLED_TIMEOUT_MS),
-    });
-
-    if (!resp.ok) throw new Error(`ACLED API error: ${resp.status}`);
-    const data = (await resp.json()) as { data?: AcledRawEvent[]; message?: string; error?: string };
-    if (data.message || data.error) throw new Error(data.message || data.error || 'ACLED API error');
-
-    const events = data.data || [];
-    return events.length > 0 ? events : null;
-  });
-  return result || [];
+    return result || [];
+  } catch (err) {
+    // Honor the documented "returns [] on upstream failure" contract. A
+    // present-but-rejected token (free ACLED tier 401s the recent-data window)
+    // otherwise threw and aborted the ENTIRE risk-score computation, dropping
+    // it to pure editorial floors (degraded:true) even though every other free
+    // feed was populated. Degrade to empty so the rest of the score computes.
+    console.warn(`[acled] upstream fetch failed, returning empty: ${(err as Error).message}`);
+    return [];
+  }
 }
