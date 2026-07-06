@@ -6,6 +6,19 @@ services:
       - "127.0.0.1:3002:8080"
     security_opt:
       - no-new-privileges:true
+    networks:
+      - default
+      - main
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=main
+      - traefik.http.routers.worldmonitor.rule=Host(`worldmonitor.hippiekiller.net`)
+      - traefik.http.routers.worldmonitor.entrypoints=websecure
+      - traefik.http.routers.worldmonitor.tls=true
+      - traefik.http.routers.worldmonitor.tls.certresolver=cloudflare
+      - traefik.http.routers.worldmonitor.middlewares=ip-allowlist@file,rate-limit@file,security-headers@file
+      - traefik.http.routers.worldmonitor.service=worldmonitor
+      - traefik.http.services.worldmonitor.loadbalancer.server.port=8080
     environment:
       RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?set in .env}"
       # LLM / data keys go here when added (see SELF_HOSTING.md "API Keys")
@@ -37,3 +50,7 @@ services:
   redis-rest:
     security_opt:
       - no-new-privileges:true
+
+networks:
+  main:
+    external: true
