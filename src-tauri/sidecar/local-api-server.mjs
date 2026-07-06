@@ -1837,6 +1837,20 @@ export async function createLocalApiServer(options = {}) {
           );
         }
       }
+      // Docker self-host ONLY, same containment as the Redis block above:
+      // WS_RELAY_URL points at the internal ais-relay host (compose sets
+      // http://ais-relay:3004). Without trusting it, every relay-proxied
+      // route (/api/opensky, telegram-feed, polymarket, oref-alerts) is
+      // SSRF-blocked with "resolves to a private/reserved IP address".
+      if (context.mode === 'docker' && process.env.WS_RELAY_URL) {
+        try {
+          extraAllowedPrivateOrigins.push(new URL(process.env.WS_RELAY_URL).origin);
+        } catch (err) {
+          context.logger.warn(
+            `[local-api] WS_RELAY_URL is not a valid URL; not added to the private-fetch allowlist (relay calls will be SSRF-blocked): ${err.message}`,
+          );
+        }
+      }
       if (context.allowPrivateRemoteBase) {
         try { extraAllowedPrivateOrigins.push(new URL(context.remoteBase).origin); } catch {}
       }
