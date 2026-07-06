@@ -375,6 +375,14 @@ const runtimeConfig: RuntimeConfig = {
   secrets: {},
 };
 
+// Homelab self-host: a license key baked in at build (WM_LICENSE_KEY → the
+// __WM_LICENSE_KEY__ define) unlocks Pro without the desktop-only key-entry
+// UI. Present → hasPremiumAccess() is true and premium-fetch sends it as
+// X-WorldMonitor-Key (matched against the server's WORLDMONITOR_VALID_KEYS).
+if (typeof __WM_LICENSE_KEY__ === 'string' && __WM_LICENSE_KEY__) {
+  runtimeConfig.secrets['WORLDMONITOR_API_KEY'] = { value: __WM_LICENSE_KEY__, source: 'env' };
+}
+
 let localApiTokenPromise: Promise<string | null> | null = null;
 
 function notifyConfigChanged(): void {

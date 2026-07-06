@@ -2,6 +2,11 @@
 # secrets live in the gitignored .env).
 services:
   worldmonitor:
+    build:
+      args:
+        # Bakes the operator license key into the client bundle at build.
+        # Value from .env (gitignored) — never committed.
+        WM_LICENSE_KEY: "${WM_LICENSE_KEY:-}"
     ports: !override
       - "127.0.0.1:3002:8080"
     security_opt:
@@ -28,6 +33,10 @@ services:
       # closed (503) without it, which 401s every session-authed API route —
       # the whole dashboard reads as dead. Min 32 chars.
       WM_SESSION_SECRET: "${WM_SESSION_SECRET:?set in .env}"
+      # Operator/enterprise key allowlist — the baked-in license key (above)
+      # is matched against this server-side to bypass the entitlement gate on
+      # tier-gated routes (api/_api-key.js isValidEnterpriseKey).
+      WORLDMONITOR_VALID_KEYS: "${WORLDMONITOR_VALID_KEYS:-}"
     # Upstream healthcheck is broken for self-hosting: `localhost` resolves to
     # ::1 (nginx is IPv4-only) and /api/health 401s without an operator API
     # key. Probe the SPA root over IPv4 instead.
@@ -48,6 +57,10 @@ services:
       - no-new-privileges:true
     environment:
       RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?set in .env}"
+      # OpenSky OAuth — anonymous access is rate-limited into uselessness
+      # (502s); scripts/ais-relay.cjs uses these for the ADS-B feed.
+      OPENSKY_CLIENT_ID: "${OPENSKY_CLIENT_ID:-}"
+      OPENSKY_CLIENT_SECRET: "${OPENSKY_CLIENT_SECRET:-}"
 
   redis:
     security_opt:

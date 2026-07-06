@@ -900,6 +900,11 @@ export default defineConfig(({ mode }) => {
     },
     define: {
       __APP_VERSION__: JSON.stringify(pkg.version),
+      // Homelab self-host: baked-in operator license key (from WM_LICENSE_KEY
+      // build env). Empty string on upstream/normal builds. Seeded into the
+      // runtime secret store so hasPremiumAccess() unlocks and premium-fetch
+      // sends it as X-WorldMonitor-Key.
+      __WM_LICENSE_KEY__: JSON.stringify(process.env.WM_LICENSE_KEY || ''),
       // Resolved + build-time validated above (devDependencies fallback +
       // non-empty + major-pairing guards).
       __CLERK_JS_VERSION__: JSON.stringify(CLERK_JS_VERSION),

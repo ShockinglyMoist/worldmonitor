@@ -23,6 +23,11 @@ COPY . .
 # Output is api/**/*.js alongside the source .ts files
 RUN node docker/build-handlers.mjs
 
+# Homelab: license key baked into the bundle at build (value never in git —
+# comes from the compose build-arg, sourced from the gitignored .env).
+ARG WM_LICENSE_KEY=""
+ENV WM_LICENSE_KEY=$WM_LICENSE_KEY
+
 # Build Vite frontend (outputs to dist/)
 # Skip blog build — blog-site has its own deps not installed here
 RUN npx tsc && npx vite build
