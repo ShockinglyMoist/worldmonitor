@@ -21,7 +21,9 @@ services:
       - traefik.http.services.worldmonitor.loadbalancer.server.port=8080
     environment:
       RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?set in .env}"
-      # LLM / data keys go here when added (see SELF_HOSTING.md "API Keys")
+      # Not in upstream's compose env list but read by the in-app webcam route
+      # (server/worldmonitor/webcam/v1/get-webcam-image.ts). Value in .env.
+      WINDY_API_KEY: "${WINDY_API_KEY:-}"
     # Upstream healthcheck is broken for self-hosting: `localhost` resolves to
     # ::1 (nginx is IPv4-only) and /api/health 401s without an operator API
     # key. Probe the SPA root over IPv4 instead.
