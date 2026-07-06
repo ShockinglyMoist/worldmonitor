@@ -3,6 +3,7 @@ import { clearPanelColSpanEntry, clearPanelSpanEntry } from '@/utils/panel-stora
 import { sanitizeWidgetHtml } from '@/utils/widget-sanitizer';
 import { getAuthState } from '@/services/auth-state';
 import { isEntitled } from '@/services/entitlements';
+import { getSecretState } from '@/services/runtime-config';
 import {
   clearLegacyKeyStorage,
   migrateLegacyKeysToHttpOnlySession,
@@ -179,6 +180,10 @@ export function isProWidgetEnabled(): boolean {
 
 export function isProUser(): boolean {
   return (
+    // Homelab: operator license key counts as Pro here too. hasPremiumAccess()
+    // already honored it, but the panel/source/layer *limits* gate on
+    // isProUser() directly, so without this the caps stayed enforced.
+    getSecretState('WORLDMONITOR_API_KEY').present ||
     isWidgetFeatureEnabled() ||
     isProWidgetEnabled() ||
     getAuthState().user?.role === 'pro' ||
