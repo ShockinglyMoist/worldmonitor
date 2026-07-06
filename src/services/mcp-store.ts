@@ -160,10 +160,10 @@ export const MCP_PRESETS: McpPreset[] = [
     icon: '📄',
     description: 'Fetch and read any public URL as plain text or markdown via Cloudflare Browser Rendering',
     serverUrl: 'https://browser.mcp.cloudflare.com/mcp',
-    authNote: 'Requires Authorization: Bearer <CF_API_TOKEN> (from Cloudflare dashboard)',
+    authNote: 'Requires Authorization: Bearer <CF_API_TOKEN> with the Browser Run permission (Cloudflare dashboard)',
     apiKeyHeader: 'Authorization: Bearer {key}',
-    defaultTool: 'fetch',
-    defaultArgs: { url: 'https://example.com', maxLength: 5000 },
+    defaultTool: 'get_url_markdown',
+    defaultArgs: { url: 'https://example.com' },
     defaultTitle: 'Web Fetch',
   },
   {
