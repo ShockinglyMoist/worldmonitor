@@ -23,6 +23,15 @@ services:
       - traefik.http.routers.worldmonitor.tls.certresolver=cloudflare
       - traefik.http.routers.worldmonitor.middlewares=ip-allowlist@file,rate-limit@file,security-headers@file
       - traefik.http.routers.worldmonitor.service=worldmonitor
+      # TEMPORARY public showcase route (Stan, 2026-07-08): no ip-allowlist by
+      # design — short-lived demo, NOT behind Authentik. Tear down by removing
+      # these wm labels + the proxied Cloudflare A record `wm`.
+      - traefik.http.routers.worldmonitor-public.rule=Host(`wm.hippiekiller.net`)
+      - traefik.http.routers.worldmonitor-public.entrypoints=websecure
+      - traefik.http.routers.worldmonitor-public.tls=true
+      - traefik.http.routers.worldmonitor-public.tls.certresolver=cloudflare
+      - traefik.http.routers.worldmonitor-public.middlewares=rate-limit@file,security-headers@file
+      - traefik.http.routers.worldmonitor-public.service=worldmonitor
       - traefik.http.services.worldmonitor.loadbalancer.server.port=8080
     environment:
       RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?set in .env}"
