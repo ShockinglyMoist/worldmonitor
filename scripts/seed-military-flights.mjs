@@ -10,7 +10,11 @@ loadEnvFile(import.meta.url);
 
 const LIVE_KEY = 'military:flights:v1';
 const STALE_KEY = 'military:flights:stale:v1';
-const LIVE_TTL = 600;
+// 40min, not upstream's 600s: the self-host timer runs every 30min and
+// seed-military-cii (which reads the live key) executes alphabetically BEFORE
+// this seeder each run — at 600s the key was always expired when cii looked,
+// so cii skipped publishing every single run.
+const LIVE_TTL = 2400;
 const STALE_TTL = 86400;
 
 const THEATER_POSTURE_LIVE_KEY = 'theater-posture:sebuf:v1';

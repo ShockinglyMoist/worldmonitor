@@ -104,6 +104,35 @@ ok=0 fail=0 skip=0 timedout=0
 for f in "$SCRIPT_DIR"/seed-*.mjs; do
   name="$(basename "$f")"
   printf "→ %s ... " "$name"
+  # Homelab skips — sources that cannot succeed here, so they don't log as FAIL:
+  # consumer-prices is a manual fallback (hard-requires --force; the authoritative
+  # writer is the private consumer-prices-core cloud pipeline); iran-events reads
+  # a manually-dropped LiveUAMap scrape that only sometimes exists.
+  case "$name" in
+    seed-consumer-prices.mjs)
+      printf "SKIP (manual-fallback script; cloud pipeline is authoritative)\n"
+      skip=$((skip + 1)); continue ;;
+    seed-iran-events.mjs)
+      if [ ! -f "$SCRIPT_DIR/data/iran-events-latest.json" ]; then
+        printf "SKIP (manual data file scripts/data/iran-events-latest.json absent)\n"
+        skip=$((skip + 1)); continue
+      fi ;;
+    seed-bundle-resilience-validation.mjs)
+      # Its Sensitivity-Suite child imports ../server/*.ts — plain node can't
+      # resolve those; upstream's Dockerfile.seed-bundle-resilience-validation
+      # wires the tsx ESM loader the same way.
+      output=$(NODE_OPTIONS="${NODE_OPTIONS:-} --import=file://$PROJECT_DIR/node_modules/tsx/dist/loader.mjs" run_seed "$f")
+      rc=$?
+      last=$(echo "$output" | tail -1)
+      if echo "$last" | grep -qi "skip\|not set\|missing.*key\|not found"; then
+        printf "SKIP (%s)\n" "$last"; skip=$((skip + 1))
+      elif [ $rc -eq 0 ]; then
+        printf "OK\n"; ok=$((ok + 1))
+      else
+        printf "FAIL (%s)\n" "$last"; fail=$((fail + 1))
+      fi
+      continue ;;
+  esac
   output=$(run_seed "$f")
   rc=$?
   last=$(echo "$output" | tail -1)

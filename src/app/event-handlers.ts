@@ -85,8 +85,6 @@ import { getCachedGpsInterference } from '@/services/gps-interference';
 import { dataFreshness } from '@/services/data-freshness';
 import { mlWorker } from '@/services/ml-worker';
 import { WM_OPEN_NOTIFICATIONS_FOR_COUNTRY } from '@/utils/notify-country-link';
-import { AuthLauncher } from '@/components/AuthLauncher';
-import { AuthHeaderWidget } from '@/components/AuthHeaderWidget';
 import { t } from '@/services/i18n';
 import { TvModeController } from '@/services/tv-mode';
 import { getAuthState, subscribeAuthState } from '@/services/auth-state';
@@ -1809,22 +1807,9 @@ export class EventHandlerManager implements AppModule {
     );
   }
 
-  setupAuthWidget(): void {
-    const modal = new AuthLauncher();
-    this.ctx.authModal = modal;
-
-    // The settings gear is rendered once by the standalone unifiedSettings
-    // button (#unifiedSettingsMount), which is mounted regardless of auth state
-    // (so signed-out users keep it too). Passing onSettingsClick here makes
-    // AuthHeaderWidget render a second gear next to the avatar for signed-in
-    // users — a duplicate. Leave it unset.
-    const widget = new AuthHeaderWidget(() => modal.open());
-    this.ctx.authHeaderWidget = widget;
-    const mount = document.getElementById('authWidgetMount');
-    if (mount) {
-      mount.appendChild(widget.getElement());
-    }
-  }
+  // setupAuthWidget() removed for self-host (Clerk cloud auth has no backend
+  // here). ctx.authModal / ctx.authHeaderWidget stay null; all consumers use
+  // optional chaining.
 
   setupPlaybackControl(): void {
     // Always create — show/hide reactively via auth state subscription below.

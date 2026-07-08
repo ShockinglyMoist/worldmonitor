@@ -1510,7 +1510,8 @@ export class App {
     // Correlation engine is constructed lazily at its post-loadAllData run site
     // (Phase 6 below) so its bytes + adapters stay off the eager boot graph (#4486).
     this.eventHandlers.setupUnifiedSettings();
-    this.eventHandlers.setupAuthWidget();
+    // setupAuthWidget() removed for self-host: Clerk never loads without
+    // VITE_CLERK_PUBLISHABLE_KEY, leaving permanent skeleton pills in the header.
     // Capture any ?ref= / ?wm_referral= from the URL into localStorage
     // and strip from the visible URL. Runs BEFORE the pending-checkout
     // capture so a /dashboard?ref=X&checkoutProduct=Y landing preserves both

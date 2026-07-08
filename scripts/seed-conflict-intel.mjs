@@ -21,10 +21,10 @@ import { loadEnvFile, CHROME_UA, runSeed, writeExtraKeyWithMeta, sleep, loadShar
 loadEnvFile(import.meta.url);
 
 const ACLED_CACHE_KEY = 'conflict:acled:v1:all:0:0';
-const ACLED_TTL = 900;
+const ACLED_TTL = 2700; // 45min — self-host timer reseeds every 30min (was 900s, expired mid-cycle)
 const HAPI_CACHE_KEY_PREFIX = 'conflict:humanitarian:v1';
 const HAPI_TTL = 21600;
-const PIZZINT_TTL = 600;
+const PIZZINT_TTL = 2700; // 45min — self-host timer reseeds every 30min (was 600s, expired mid-cycle)
 
 const CONFLICT_COUNTRIES = [
   'AF', 'SY', 'UA', 'SD', 'SS', 'SO', 'CD', 'MM', 'YE', 'ET',

@@ -15,7 +15,7 @@
  * NOT an error condition for sentinel values like "Global".
  */
 
-import COUNTRY_NAMES_RAW from '../../shared/country-names.json';
+import COUNTRY_NAMES_RAW from '../../shared/country-names.json' with { type: 'json' };
 
 const COUNTRY_NAMES = COUNTRY_NAMES_RAW as Record<string, string>;
 

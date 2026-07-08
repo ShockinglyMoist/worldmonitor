@@ -598,4 +598,7 @@ runSeed('sanctions', 'pressure', CANONICAL_KEY, fetchSanctionsPressure, {
   declareRecords,
   schemaVersion: 1,
   maxStaleMin: 720,
+}).catch((err) => {
+  const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : ''; console.error('FATAL:', (err.message || err) + _cause);
+  process.exit(1);
 });

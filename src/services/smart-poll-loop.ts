@@ -106,6 +106,7 @@ export function startSmartPollLoop(
   let inFlight = false;
   let backoffMultiplier = 1;
   let activeController: AbortController | null = null;
+  let lastRunAt = Date.now();
 
   const clearTimer = () => {
     if (!timerId) return;
@@ -127,15 +128,25 @@ export function startSmartPollLoop(
     return Math.max(minIntervalMs, Math.round(jittered));
   };
 
-  const scheduleNext = () => {
+  const scheduleNext = (creditElapsed = false) => {
     if (!active) return;
     clearTimer();
     const base = baseDelayMs(isDocumentHidden());
     if (base === null) return;
+    let delay = computeDelay(base);
+    if (creditElapsed) {
+      // Visible-resume path only: count time already elapsed since the last
+      // completed run toward the countdown. Without this, every hide/show flip
+      // restarts the full interval and a pauseWhenHidden loop can starve under
+      // fragmented visibility. Not applied to shouldRun/inFlight reschedules —
+      // crediting there would spin stale loops at minIntervalMs.
+      const remaining = Math.max(minIntervalMs, base - (Date.now() - lastRunAt));
+      delay = Math.min(delay, remaining);
+    }
     timerId = setTimeout(() => {
       timerId = null;
       void runOnce('interval');
-    }, computeDelay(base));
+    }, delay);
   };
 
   const runOnce = async (reason: SmartPollReason): Promise<void> => {
@@ -179,6 +190,7 @@ export function startSmartPollLoop(
     } finally {
       if (activeController === controller) activeController = null;
       inFlight = false;
+      lastRunAt = Date.now();
       scheduleNext();
     }
   };
@@ -210,7 +222,7 @@ export function startSmartPollLoop(
       return;
     }
 
-    scheduleNext();
+    scheduleNext(true);
   };
 
   const onVisibilityChange = () => {

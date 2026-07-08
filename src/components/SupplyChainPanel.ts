@@ -19,6 +19,7 @@ import { hasPremiumAccess } from '@/services/panel-gating';
 import { trackGateHit } from '@/services/analytics';
 import { runScenario, getScenarioStatus } from '@/services/scenario';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+import { attributionFooterHtml, ATTRIBUTION_FOOTER_CSS } from '@/utils/attribution-footer';
 
 
 type TabId = 'chokepoints' | 'shipping' | 'indicators' | 'minerals' | 'stress';
@@ -154,10 +155,19 @@ export class SupplyChainPanel extends Panel {
       case 'stress': contentHtml = this.renderStress(); break;
     }
 
+    // Truthiness guard intentionally drops the empty-state sentinels ('' and 0)
+    // that the chokepoints/stress responses carry when their upstream key is
+    // unavailable.
+    const fetchedAt = (activeData as { fetchedAt?: string | number } | null)?.fetchedAt;
+    const footerHtml = fetchedAt
+      ? attributionFooterHtml({ sourceType: 'derived', updatedAt: fetchedAt }) + ATTRIBUTION_FOOTER_CSS
+      : '';
+
     this.setSafeContent(unsafeRawHtml(`
       ${tabsHtml}
       ${unavailableBanner}
       <div class="economic-content">${contentHtml}</div>
+      ${footerHtml}
     `, 'legacy Panel.setContent() migration'));
 
     if (this.activeTab === 'chokepoints' && this.expandedChokepoint) {

@@ -13,7 +13,7 @@ import { loadEnvFile, CHROME_UA, runSeed, writeExtraKeyWithMeta, sleep } from '.
 loadEnvFile(import.meta.url);
 
 const ARXIV_TTL = 3600;
-const HN_TTL = 600;
+const HN_TTL = 2700; // 45min — self-host timer reseeds every 30min (was 600s; list-hackernews-items has no live fallback, so items blanked 20 of every 30min)
 const TECH_EVENTS_TTL = 28800; // 8h — outlives maxStaleMin:480 for health buffer
 const TRENDING_TTL = 3600;
 

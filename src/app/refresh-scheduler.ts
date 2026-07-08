@@ -11,7 +11,7 @@ export interface RefreshRegistration {
 
 export class RefreshScheduler implements AppModule {
   private ctx: AppContext;
-  private refreshRunners = new Map<string, { loop: SmartPollLoopHandle; intervalMs: number }>();
+  private refreshRunners = new Map<string, { loop: SmartPollLoopHandle; intervalMs: number; lastRunAt: number }>();
   private flushTimeoutIds = new Set<ReturnType<typeof setTimeout>>();
   private hiddenSince = 0;
   private visibilityHub = new VisibilityHub();
@@ -60,6 +60,8 @@ export class RefreshScheduler implements AppModule {
       try {
         return await fn();
       } finally {
+        const entry = this.refreshRunners.get(name);
+        if (entry) entry.lastRunAt = Date.now();
         this.ctx.inFlight.delete(name);
       }
     }, {
@@ -74,12 +76,11 @@ export class RefreshScheduler implements AppModule {
       },
     });
 
-    this.refreshRunners.set(name, { loop, intervalMs });
+    this.refreshRunners.set(name, { loop, intervalMs, lastRunAt: Date.now() });
   }
 
   flushStaleRefreshes(): void {
     if (!this.hiddenSince) return;
-    const hiddenMs = Date.now() - this.hiddenSince;
     this.hiddenSince = 0;
 
     for (const timeoutId of this.flushTimeoutIds) {
@@ -87,10 +88,14 @@ export class RefreshScheduler implements AppModule {
     }
     this.flushTimeoutIds.clear();
 
-    // Collect stale tasks and sort by interval ascending (highest-frequency first)
+    // Staleness is measured against the last COMPLETED run, not the length of
+    // the most recent hidden stretch: every hide/show flip restarts each loop's
+    // full countdown (smart-poll-loop discards elapsed time on resume), so
+    // fragmented hidden periods shorter than the interval would otherwise keep
+    // resetting the countdown and a loop could starve indefinitely.
     const stale: { loop: SmartPollLoopHandle; intervalMs: number }[] = [];
     for (const entry of this.refreshRunners.values()) {
-      if (hiddenMs >= entry.intervalMs) {
+      if (Date.now() - entry.lastRunAt >= entry.intervalMs) {
         stale.push(entry);
       }
     }

@@ -6,7 +6,7 @@ import { resolveIso2, normalizeCountryToken } from './_country-resolver.mjs';
 loadEnvFile(import.meta.url);
 
 const CANONICAL_KEY = 'correlation:cards-bootstrap:v1';
-const CACHE_TTL = 1200; // 20min — outlives maxStaleMin:15 with buffer (cron runs every 5min)
+const CACHE_TTL = 2700; // 45min — self-host timer reseeds every 30min (upstream's 1200s assumed a 5-min cron; keys were expiring ~10min before each reseed)
 const MIN_CORRELATION_CARDS = 1;
 const CORRELATION_CARD_DOMAINS = ['military', 'escalation', 'economic', 'disaster'];
 

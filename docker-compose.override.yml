@@ -37,6 +37,11 @@ services:
       # is matched against this server-side to bypass the entitlement gate on
       # tier-gated routes (api/_api-key.js isValidEnterpriseKey).
       WORLDMONITOR_VALID_KEYS: "${WORLDMONITOR_VALID_KEYS:-}"
+      # Shared secret for seed-resilience-scores.mjs ?refresh=1 requests — the
+      # server timingSafeEquals this against the seeder's X-WorldMonitor-Key
+      # (server/gateway.ts isResilienceRankingSeedRefreshRequest). Self-minted;
+      # value in .env. Without it the resilience ranking never populates.
+      WORLDMONITOR_SEED_REFRESH_KEY: "${WORLDMONITOR_SEED_REFRESH_KEY:-}"
     # Upstream healthcheck is broken for self-hosting: `localhost` resolves to
     # ::1 (nginx is IPv4-only) and /api/health 401s without an operator API
     # key. Probe the SPA root over IPv4 instead.

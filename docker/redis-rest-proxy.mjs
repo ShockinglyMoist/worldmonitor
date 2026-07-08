@@ -70,7 +70,11 @@ async function runCommand(args) {
   return client.sendCommand([cmd, ...cmdArgs.map(String)]);
 }
 
-const MAX_BODY_BYTES = 1024 * 1024; // 1 MB
+// 16 MB: several seeders legitimately ship multi-MB payloads (sanctions entity
+// index ~2.7 MB, hs2 chokepoint-exposure pipeline ~3.7 MB, vpd-tracker history)
+// and the proxy is loopback-only + bearer-authed, so the DoS surface is nil.
+// At 1 MB those writes died as "other side closed" and their keys never existed.
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
 async function readBody(req) {
   const chunks = [];

@@ -127,7 +127,12 @@ export class StrategicPosturePanel extends Panel {
       // Fetch aircraft data from server
       this.showLoadingStage('aircraft');
       const data = await fetchCachedTheaterPosture(this.signal);
-      if (!this.element?.isConnected) return;
+      // Guard on destroy (signal aborts), NOT on element.isConnected: panels
+      // are constructed detached and attached moments later, so a fast fetch
+      // (bootstrap hydration) resolves before attachment — the old isConnected
+      // check bailed here on every cold load and the loader never cleared.
+      // Rendering into a detached element is fine; it attaches with content.
+      if (this.signal.aborted) return;
       if (!data || !data.postures?.length) {
         this.showNoData();
         return;
@@ -141,12 +146,19 @@ export class StrategicPosturePanel extends Panel {
       this.lastTimestamp = data.timestamp;
       this.isStale = data.stale || false;
 
-      // Try to augment with vessel data (client-side)
-      this.showLoadingStage('vessels');
-      await this.augmentWithVessels();
-      if (!this.element?.isConnected) return;
+      // Paint posture data immediately — vessel augmentation must not block
+      // first paint. The vessels path (lazy military-vessels import + USNI RPC)
+      // has no hard timeout and can stall indefinitely on deployments with thin
+      // AIS coverage, which left this panel stuck on the loader with healthy
+      // posture data already in hand. reaugmentVessels() already re-renders
+      // later as AIS accumulates, so a second render here is the same pattern.
+      this.updateBadges();
+      this.render();
 
-      this.showLoadingStage('analysis');
+      // Try to augment with vessel data (client-side)
+      await this.augmentWithVessels();
+      if (this.signal.aborted) return;
+
       this.updateBadges();
       this.render();
 

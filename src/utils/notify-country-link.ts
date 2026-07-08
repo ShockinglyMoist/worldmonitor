@@ -168,8 +168,11 @@ function renderHtml(state: ViewState, props: NotifyCountryLinkProps): string {
 export function renderNotifyCountryLink(
   props: NotifyCountryLinkProps,
 ): NotifyCountryLinkHandle {
+  // Self-host: the notifications feature this bell opens is cloud-only
+  // (Clerk account + Convex rules + cloud digest cron) — never render it.
+  const NOTIFY_LINK_ENABLED = false;
   // Feature flag off → empty html, no-op attach. Mirrors FollowButton.
-  if (!isFollowFeatureEnabled()) {
+  if (!NOTIFY_LINK_ENABLED || !isFollowFeatureEnabled()) {
     return {
       html: '',
       attach: (_host: HTMLElement) => () => {
