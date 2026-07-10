@@ -125,7 +125,6 @@ import type { PredictionPanel } from '@/components/PredictionPanel';
 import type { MonitorPanel } from '@/components/MonitorPanel';
 import type { InsightsPanel } from '@/components/InsightsPanel';
 import type { ThreatTimelinePanel } from '@/components/ThreatTimelinePanel';
-import type { InternetDisruptionsPanel } from '@/components/InternetDisruptionsPanel';
 import type { StrategicPosturePanel } from '@/components/StrategicPosturePanel';
 import type { EconomicPanel } from '@/components/EconomicPanel';
 import type { EnergyComplexPanel } from '@/components/EnergyComplexPanel';
@@ -860,8 +859,12 @@ export class DataLoaderManager implements AppModule {
         }
       } catch { /* non-fatal */ }
     }
-    // Intelligence signals: run for any variant that shows these panels
-    if (shouldLoadAny(['cii', 'strategic-risk', 'strategic-posture', 'climate', 'population-exposure', 'security-advisories', 'radiation-watch', 'displacement', 'ucdp-events', 'satellite-fires', 'oref-sirens'])) {
+    // Intelligence signals: run for any variant that shows these panels.
+    // 'internet-disruptions' MUST be here — the outages/ddos/anomalies fetch
+    // lives inside loadIntelligenceSignals, so a variant showing that panel
+    // without any other trigger panel (e.g. tech) would otherwise never fetch,
+    // leaving the panel stuck on "Loading".
+    if (shouldLoadAny(['cii', 'strategic-risk', 'strategic-posture', 'climate', 'population-exposure', 'security-advisories', 'radiation-watch', 'displacement', 'ucdp-events', 'satellite-fires', 'oref-sirens', 'internet-disruptions'])) {
       tasks.push({ name: 'intelligence', task: () => runGuarded('intelligence', () => this.loadIntelligenceSignals()) });
     }
 
@@ -2454,14 +2457,17 @@ export class DataLoaderManager implements AppModule {
           this.ctx.map?.setLayerReady('outages', outages.length > 0);
           this.ctx.statusPanel?.updateFeed('NetBlocks', { status: 'ok', itemCount: outages.length });
         }
-        (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setOutages(outages);
+        // Route through callPanel (not a raw `?.` cast) so the data is queued
+        // and replayed if internet-disruptions — a below-the-fold lazyPanel —
+        // hasn't mounted yet; otherwise this fire-once push is silently dropped.
+        this.callPanel('internet-disruptions', 'setOutages', outages);
         fetchTrafficAnomalies().then(r => {
           this.ctx.map?.setTrafficAnomalies(r.anomalies);
-          (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setAnomalies(r.anomalies);
+          this.callPanel('internet-disruptions', 'setAnomalies', r.anomalies);
         }).catch(() => {});
         fetchDdosAttacks().then(r => {
           this.ctx.map?.setDdosLocations(r.topTargetLocations ?? []);
-          (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setDdos(r);
+          this.callPanel('internet-disruptions', 'setDdos', r);
         }).catch(() => {});
       } catch (error) {
         console.error('[Intelligence] Outages fetch failed:', error);
@@ -2758,6 +2764,9 @@ export class DataLoaderManager implements AppModule {
       this.ctx.map?.setOutages(outages);
       this.ctx.map?.setLayerReady('outages', outages.length > 0);
       this.ctx.statusPanel?.updateFeed('NetBlocks', { status: 'ok', itemCount: outages.length });
+      // Re-feed the panel on this cache-hit refresh too — the early return used
+      // to skip it, so a panel that mounted after the initial load never got data.
+      this.callPanel('internet-disruptions', 'setOutages', outages);
       return;
     }
     try {
@@ -2769,14 +2778,14 @@ export class DataLoaderManager implements AppModule {
       await runSignalAggregator(this.ctx.statusPanel, 'outages', (aggregator) => aggregator.ingestOutages(outages));
       this.ctx.statusPanel?.updateFeed('NetBlocks', { status: 'ok', itemCount: outages.length });
       dataFreshness.recordUpdate('outages', outages.length);
-      (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setOutages(outages);
+      this.callPanel('internet-disruptions', 'setOutages', outages);
       fetchTrafficAnomalies().then(r => {
         this.ctx.map?.setTrafficAnomalies(r.anomalies);
-        (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setAnomalies(r.anomalies);
+        this.callPanel('internet-disruptions', 'setAnomalies', r.anomalies);
       }).catch(() => {});
       fetchDdosAttacks().then(r => {
         this.ctx.map?.setDdosLocations(r.topTargetLocations ?? []);
-        (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setDdos(r);
+        this.callPanel('internet-disruptions', 'setDdos', r);
       }).catch(() => {});
     } catch (error) {
       this.callPanel('internet-disruptions', 'showError');
