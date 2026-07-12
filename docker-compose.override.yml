@@ -72,6 +72,12 @@ services:
       - no-new-privileges:true
 
   redis-rest:
+    # node runs as PID 1 here and does NOT reap orphaned children. A scheduled
+    # monitor `docker exec`s `wget https://…` into this alpine container; the
+    # BusyBox `ssl_client` children orphan and pile up as zombies (tripped the
+    # host's Zombie Process Alert at ~19 > threshold 10). tini as PID 1 reaps
+    # them — same reason homelab-seed.sh runs the seeders with `--init`.
+    init: true
     security_opt:
       - no-new-privileges:true
 
