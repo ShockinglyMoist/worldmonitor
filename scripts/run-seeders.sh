@@ -113,7 +113,10 @@ FAIL_TAIL_LINES="${FAIL_TAIL_LINES:-25}"
 SEED_LOG_DIR="${SEED_LOG_DIR:-$PROJECT_DIR/logs}"
 if mkdir -p "$SEED_LOG_DIR" 2>/dev/null; then
   RUN_LOG="$SEED_LOG_DIR/seeders-$(date -u +%Y%m%dT%H%M%SZ).log"
-  : > "$RUN_LOG" 2>/dev/null || RUN_LOG=""
+  # `touch`, not `: >` — see the note on mark_attempt(): a redirection failure on
+  # the special builtin `:` exits the shell outright, so an unwritable log dir
+  # would abort the entire seeding run instead of just disabling diagnostics.
+  touch "$RUN_LOG" 2>/dev/null || RUN_LOG=""
   # Diagnostics, not durable data — two weeks is plenty and bounds the growth.
   find "$SEED_LOG_DIR" -maxdepth 1 -name 'seeders-*.log' -mtime +14 -delete 2>/dev/null || true
 else
@@ -155,9 +158,19 @@ too_soon() {
   [ "$_ts_age" -lt "$2" ]
 }
 
+# NB: `touch`, not `: > file`. `:` is a POSIX *special builtin*, and a redirection
+# failure on a special builtin makes the shell EXIT — `2>/dev/null || true` cannot
+# catch it, because the shell is gone before the || is reached. With `: >` here, a
+# state dir that had vanished or turned unwritable mid-run aborted the whole
+# seeding run at the first gated seeder and took ~100 healthy seeders with it
+# (observed for real: "can't create …/seed-climate-anomalies.mjs.stamp:
+# nonexistent directory", service exit 1). Stamping is best-effort bookkeeping and
+# must never be able to end the run — worst case the gate just doesn't engage.
 mark_attempt() {
   [ -n "$SEED_STATE_DIR" ] || return 0
-  : > "$SEED_STATE_DIR/$1.stamp" 2>/dev/null || true
+  mkdir -p "$SEED_STATE_DIR" 2>/dev/null || return 0
+  touch "$SEED_STATE_DIR/$1.stamp" 2>/dev/null || true
+  return 0
 }
 
 # Whole hours remaining, for the SKIP line. Floor, so "0h" means "under an hour".
