@@ -142,6 +142,7 @@ SEED_STATE_DIR="${SEED_STATE_DIR:-$SEED_LOG_DIR/.state}"
 mkdir -p "$SEED_STATE_DIR" 2>/dev/null || SEED_STATE_DIR=""
 ZONE_NORMALS_MIN_INTERVAL="${ZONE_NORMALS_MIN_INTERVAL:-2592000}"   # 30d
 CLIMATE_ANOMALIES_MIN_INTERVAL="${CLIMATE_ANOMALIES_MIN_INTERVAL:-21600}"  # 6h
+AVIATION_INTL_MIN_INTERVAL="${AVIATION_INTL_MIN_INTERVAL:-21600}"  # 6h
 
 # 0 (true) = ran more recently than $2 seconds ago, so skip this pass.
 too_soon() {
@@ -198,6 +199,31 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
       if [ ! -f "$SCRIPT_DIR/data/iran-events-latest.json" ]; then
         printf "SKIP (manual data file scripts/data/iran-events-latest.json absent)\n"
         skip=$((skip + 1)); continue
+      fi ;;
+    seed-aviation.mjs)
+      # Gate ONLY the paid AviationStack section. GH #262.
+      #
+      # seed-aviation does four things; three of them (FAA delays, NOTAM news,
+      # the 130-airport bootstrap) succeed on every tick and are worth their
+      # 30min cadence. Only the intl section calls AviationStack — 52 airports a
+      # tick, ~2,500 calls/day, all of it 429 "usage_limit_reached" against a
+      # plan that cannot absorb it.
+      #
+      # The seeder has its own INTL_MIN_REFRESH_MIN floor, but it keys off the
+      # last SUCCESSFUL publish (deliberately, so a transient outage still
+      # retries) — which means a quota wall retries every tick forever and keeps
+      # the quota spent. Its cap is 60min anyway, too low to matter here.
+      #
+      # So gate at the wrapper, and gate the paid part only: on a non-due tick
+      # run the seeder with AVIATIONSTACK_API unset, which it already handles as
+      # a first-class skip ("[Intl] No AVIATIONSTACK_API key — skipping",
+      # seed-aviation.mjs:474). Unsetting is safe for the rest of this run —
+      # nothing else reads that var, and each timer run re-sources .env fresh.
+      if too_soon "$name" "$AVIATION_INTL_MIN_INTERVAL"; then
+        printf "[intl gated ~%sh] " "$(hours_left "$name" "$AVIATION_INTL_MIN_INTERVAL")"
+        unset AVIATIONSTACK_API
+      else
+        mark_attempt "$name"
       fi ;;
     seed-climate-zone-normals.mjs)
       if too_soon "$name" "$ZONE_NORMALS_MIN_INTERVAL"; then
