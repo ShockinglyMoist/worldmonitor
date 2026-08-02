@@ -4,6 +4,9 @@ dist/
 public/blog/
 .DS_Store
 *.log
+# Homelab: run-seeders.sh diagnostics + per-seeder interval stamps (GH #262).
+# *.log already covers the run logs; this also covers logs/.state/*.stamp.
+/logs/
 .env
 .env.local
 .playwright-mcp/

@@ -101,6 +101,88 @@ run_seed() {
 
 ok=0 fail=0 skip=0 timedout=0
 
+# Diagnostics for non-OK seeders. Previously only `tail -1` of a seeder's output
+# survived, which threw away the script's own "FETCH FAILED: …" and per-endpoint
+# lines and made every failure look identical in the timer logs — the aviation
+# seeder had been failing 100% of runs for a week with its real cause (an
+# AviationStack HTTP 429 quota wall) invisible. GH #262.
+#
+# The one-line "FAIL (…)" summary below is deliberately unchanged so anything
+# already parsing this output keeps working; the full text is additive.
+FAIL_TAIL_LINES="${FAIL_TAIL_LINES:-25}"
+SEED_LOG_DIR="${SEED_LOG_DIR:-$PROJECT_DIR/logs}"
+if mkdir -p "$SEED_LOG_DIR" 2>/dev/null; then
+  RUN_LOG="$SEED_LOG_DIR/seeders-$(date -u +%Y%m%dT%H%M%SZ).log"
+  : > "$RUN_LOG" 2>/dev/null || RUN_LOG=""
+  # Diagnostics, not durable data — two weeks is plenty and bounds the growth.
+  find "$SEED_LOG_DIR" -maxdepth 1 -name 'seeders-*.log' -mtime +14 -delete 2>/dev/null || true
+else
+  RUN_LOG=""
+fi
+
+# Per-seeder minimum interval. GH #262.
+#
+# The timer fires this whole script every 30 min, which is right for most feeds
+# but badly wrong for the two Open-Meteo ERA5 climate seeders. seed-climate-
+# zone-normals writes a 95-day TTL and its own source comment says the cadence
+# is "a 31-day monthly interval" — running it 48x/day is ~1400x its design rate.
+# seed-climate-anomalies writes a 9h TTL, so 48x/day is ~18x oversampled.
+# Between them they burned the shared free-tier Open-Meteo daily allowance, and
+# the archive API then returned a flat "Daily API request limit exceeded" to
+# every request — which looked like an upstream outage but was self-inflicted.
+# Confirmed by hand: archive-api 429 "Daily API request limit exceeded" while
+# the separately-pooled forecast API answered 200 from the same WAN IP.
+#
+# The stamp is written on ATTEMPT, not on success. If it only counted successes,
+# a seeder failing because the quota is already spent would retry every 30 min
+# and keep the quota spent — exactly the loop this exists to break. Cost: a
+# transient failure waits a full interval to retry, which is fine for data whose
+# TTL is 9h/95d.
+SEED_STATE_DIR="${SEED_STATE_DIR:-$SEED_LOG_DIR/.state}"
+mkdir -p "$SEED_STATE_DIR" 2>/dev/null || SEED_STATE_DIR=""
+ZONE_NORMALS_MIN_INTERVAL="${ZONE_NORMALS_MIN_INTERVAL:-2592000}"   # 30d
+CLIMATE_ANOMALIES_MIN_INTERVAL="${CLIMATE_ANOMALIES_MIN_INTERVAL:-21600}"  # 6h
+
+# 0 (true) = ran more recently than $2 seconds ago, so skip this pass.
+too_soon() {
+  [ -n "$SEED_STATE_DIR" ] || return 1
+  _ts_file="$SEED_STATE_DIR/$1.stamp"
+  [ -f "$_ts_file" ] || return 1
+  _ts_then=$(stat -c %Y "$_ts_file" 2>/dev/null) || return 1
+  [ -n "$_ts_then" ] || return 1
+  _ts_age=$(( $(date +%s) - _ts_then ))
+  [ "$_ts_age" -lt "$2" ]
+}
+
+mark_attempt() {
+  [ -n "$SEED_STATE_DIR" ] || return 0
+  : > "$SEED_STATE_DIR/$1.stamp" 2>/dev/null || true
+}
+
+# Whole hours remaining, for the SKIP line. Floor, so "0h" means "under an hour".
+hours_left() {
+  _hl_file="$SEED_STATE_DIR/$1.stamp"
+  _hl_then=$(stat -c %Y "$_hl_file" 2>/dev/null || echo 0)
+  echo $(( ($2 - ( $(date +%s) - _hl_then )) / 3600 ))
+}
+
+# Full output to the run log; the tail to stderr so `journalctl -u worldmonitor-seed`
+# shows the actual error instead of one truncated line.
+record_failure() {
+  _rf_name="$1"; _rf_status="$2"; _rf_output="$3"
+  if [ -n "$RUN_LOG" ]; then
+    {
+      printf '===== %s — %s =====\n' "$_rf_name" "$_rf_status"
+      printf '%s\n\n' "$_rf_output"
+    } >> "$RUN_LOG"
+  fi
+  # Built with %s rather than inlined in the format: this script runs under dash
+  # (#!/bin/sh), whose printf treats a format string starting with "--" as an
+  # option and errors out with "Illegal option --".
+  printf '%s\n' "--- $_rf_name $_rf_status — last $FAIL_TAIL_LINES line(s) ---" >&2
+  printf '%s\n' "$_rf_output" | tail -n "$FAIL_TAIL_LINES" >&2
+}
+
 for f in "$SCRIPT_DIR"/seed-*.mjs; do
   name="$(basename "$f")"
   printf "→ %s ... " "$name"
@@ -117,6 +199,20 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
         printf "SKIP (manual data file scripts/data/iran-events-latest.json absent)\n"
         skip=$((skip + 1)); continue
       fi ;;
+    seed-climate-zone-normals.mjs)
+      if too_soon "$name" "$ZONE_NORMALS_MIN_INTERVAL"; then
+        printf "SKIP (interval gate: ~%sh until next run; 95-day TTL, monthly by design)\n" \
+          "$(hours_left "$name" "$ZONE_NORMALS_MIN_INTERVAL")"
+        skip=$((skip + 1)); continue
+      fi
+      mark_attempt "$name" ;;
+    seed-climate-anomalies.mjs)
+      if too_soon "$name" "$CLIMATE_ANOMALIES_MIN_INTERVAL"; then
+        printf "SKIP (interval gate: ~%sh until next run; 9h TTL)\n" \
+          "$(hours_left "$name" "$CLIMATE_ANOMALIES_MIN_INTERVAL")"
+        skip=$((skip + 1)); continue
+      fi
+      mark_attempt "$name" ;;
     seed-bundle-resilience-validation.mjs)
       # Its Sensitivity-Suite child imports ../server/*.ts — plain node can't
       # resolve those; upstream's Dockerfile.seed-bundle-resilience-validation
@@ -130,6 +226,7 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
         printf "OK\n"; ok=$((ok + 1))
       else
         printf "FAIL (%s)\n" "$last"; fail=$((fail + 1))
+        record_failure "$name" FAIL "$output"
       fi
       continue ;;
   esac
@@ -143,6 +240,7 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
   if caps_seed "$f" && { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; }; then
     printf "TIMEOUT (killed after %ss)\n" "$SEED_TIMEOUT"
     timedout=$((timedout + 1))
+    record_failure "$name" TIMEOUT "$output"
   elif echo "$last" | grep -qi "skip\|not set\|missing.*key\|not found"; then
     printf "SKIP (%s)\n" "$last"
     skip=$((skip + 1))
@@ -152,8 +250,12 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
   else
     printf "FAIL (%s)\n" "$last"
     fail=$((fail + 1))
+    record_failure "$name" FAIL "$output"
   fi
 done
 
 echo ""
 echo "Done: $ok ok, $skip skipped, $fail failed, $timedout timed out"
+if [ -n "$RUN_LOG" ] && [ "$((fail + timedout))" -gt 0 ]; then
+  echo "Full output for the $((fail + timedout)) non-OK seeder(s): $RUN_LOG"
+fi
