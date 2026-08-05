@@ -200,6 +200,7 @@ record_failure() {
 
 for f in "$SCRIPT_DIR"/seed-*.mjs; do
   name="$(basename "$f")"
+  aviation_gated=0
   printf "→ %s ... " "$name"
   # Homelab skips — sources that cannot succeed here, so they don't log as FAIL:
   # consumer-prices is a manual fallback (hard-requires --force; the authoritative
@@ -229,13 +230,19 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
       # the quota spent. Its cap is 60min anyway, too low to matter here.
       #
       # So gate at the wrapper, and gate the paid part only: on a non-due tick
-      # run the seeder with AVIATIONSTACK_API unset, which it already handles as
-      # a first-class skip ("[Intl] No AVIATIONSTACK_API key — skipping",
-      # seed-aviation.mjs:474). Unsetting is safe for the rest of this run —
-      # nothing else reads that var, and each timer run re-sources .env fresh.
+      # run the seeder with AVIATIONSTACK_API unset. The free side-cars (FAA,
+      # NOTAM, news, bootstrap) still run and write on every tick; the intl
+      # section skips its fetch ("[Intl] No AVIATIONSTACK_API key — skipping",
+      # seed-aviation.mjs:474) but then graceful-fails the run, because
+      # fetchIntl treats a keyless intl as unpublishable and runSeed exits
+      # with the graceful-failure code. That exit is INDUCED BY THIS GATE, so
+      # the classifier below reclassifies exactly that signature as OK instead
+      # of logging ~44 false FAILs/day. Unsetting is safe for the rest of this
+      # run — nothing else reads that var, and each timer run re-sources .env.
       if too_soon "$name" "$AVIATION_INTL_MIN_INTERVAL"; then
         printf "[intl gated ~%sh] " "$(hours_left "$name" "$AVIATION_INTL_MIN_INTERVAL")"
         unset AVIATIONSTACK_API
+        aviation_gated=1
       else
         mark_attempt "$name"
       fi ;;
@@ -297,6 +304,15 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
     printf "TIMEOUT (killed after %ss)\n" "$SEED_TIMEOUT"
     timedout=$((timedout + 1))
     record_failure "$name" TIMEOUT "$output"
+  elif [ "$aviation_gated" -eq 1 ] \
+    && echo "$output" | grep -q "intl unpublishable: no AVIATIONSTACK_API key"; then
+    # Expected outcome of the intl gate above: we unset the key on purpose, the
+    # free side-cars ran and wrote, and only the deliberately-disabled paid
+    # section "failed". Anything else that goes wrong on a gated tick (Redis
+    # down, spawn error) produces a different signature and still lands in
+    # FAIL below.
+    printf "OK (side-cars ran; intl gated)\n"
+    ok=$((ok + 1))
   elif echo "$last" | grep -qi "skip\|not set\|missing.*key\|not found"; then
     printf "SKIP (%s)\n" "$last"
     skip=$((skip + 1))
