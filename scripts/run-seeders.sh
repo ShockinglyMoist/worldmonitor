@@ -146,6 +146,7 @@ mkdir -p "$SEED_STATE_DIR" 2>/dev/null || SEED_STATE_DIR=""
 ZONE_NORMALS_MIN_INTERVAL="${ZONE_NORMALS_MIN_INTERVAL:-2592000}"   # 30d
 CLIMATE_ANOMALIES_MIN_INTERVAL="${CLIMATE_ANOMALIES_MIN_INTERVAL:-21600}"  # 6h
 AVIATION_INTL_MIN_INTERVAL="${AVIATION_INTL_MIN_INTERVAL:-21600}"  # 6h
+BUNDLE_CLIMATE_MIN_INTERVAL="${BUNDLE_CLIMATE_MIN_INTERVAL:-21600}"  # 6h
 
 # 0 (true) = ran more recently than $2 seconds ago, so skip this pass.
 too_soon() {
@@ -238,6 +239,22 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
       else
         mark_attempt "$name"
       fi ;;
+    seed-bundle-climate.mjs)
+      # The bundle re-invokes the SAME Open-Meteo seeders gated below, but its
+      # gate is success-keyed (seed-meta freshness read by _bundle-runner.mjs) —
+      # so a child that fails BECAUSE the daily quota is spent is "due" again on
+      # every 30-min tick. That kept the archive quota permanently exhausted and
+      # made the two direct gates below cosmetic (verified 2026-08-05, GH #262).
+      # Same attempt-keyed stamp as the direct gates. 6h = the smallest child
+      # cadence NOT already covered by a direct gate (Disasters, 6h); Ocean-Ice
+      # (1d) and CO2 (3d) tolerate up to +6h latency; Anomalies (3h) and
+      # Zone-Normals (30d) are the direct-gated duplicates this exists to stop.
+      if too_soon "$name" "$BUNDLE_CLIMATE_MIN_INTERVAL"; then
+        printf "SKIP (interval gate: ~%sh until next run; children success-keyed, see GH #262)\n" \
+          "$(hours_left "$name" "$BUNDLE_CLIMATE_MIN_INTERVAL")"
+        skip=$((skip + 1)); continue
+      fi
+      mark_attempt "$name" ;;
     seed-climate-zone-normals.mjs)
       if too_soon "$name" "$ZONE_NORMALS_MIN_INTERVAL"; then
         printf "SKIP (interval gate: ~%sh until next run; 95-day TTL, monthly by design)\n" \
