@@ -12,7 +12,18 @@ const NORMALS_TTL = 95 * 24 * 60 * 60; // 95 days = >3x a 31-day monthly interva
 const NORMALS_START = '1991-01-01';
 const NORMALS_END = '2020-12-31';
 const NORMALS_BATCH_SIZE = 2;
-const NORMALS_BATCH_DELAY_MS = 3_000;
+// Open-Meteo weighs a request by data volume, and each zone here is 30 years
+// of daily data — one 2-zone batch costs ~60 "call units" against the free
+// tier's per-MINUTE allowance (separate from the daily cap). At the old 3s
+// spacing, 13 batches burst well past the minute limit: every batch after the
+// first few drew rolling 429s, the 5→40s backoff retries then blew the fetch
+// deadline (observed 2026-08-05: FETCH FAILED at exactly 240000ms with daily
+// quota demonstrably free). 15s spacing holds steady-state under the minute
+// limit; the whole run is ~5-8 min, which the monthly cadence easily affords.
+const NORMALS_BATCH_DELAY_MS = (() => {
+  const v = Number(process.env.NORMALS_BATCH_DELAY_MS);
+  return Number.isFinite(v) && v >= 0 ? v : 15_000;
+})();
 
 function round(value, decimals = 2) {
   const scale = 10 ** decimals;
@@ -151,6 +162,11 @@ if (isMain) {
   runSeed('climate', 'zone-normals', CLIMATE_ZONE_NORMALS_KEY, fetchClimateZoneNormals, {
     validateFn: validate,
     ttlSeconds: NORMALS_TTL,
+    // 13 batches × (fetch + 15s pacing) ≈ 5-8 min healthy, ~20 min with full
+    // 429 backoffs. The default lock (and its derived fetch deadline,
+    // lockTtlMs + 120s margin) killed legitimate paced runs at 240s. 20 min
+    // keeps deadline (22 min) under the wrapper's 30-min SEED_TIMEOUT cap.
+    lockTtlMs: 1_200_000,
     sourceVersion: 'open-meteo-wmo-1991-2020-v1',
     declareRecords,
     schemaVersion: 1,
