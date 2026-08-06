@@ -7,6 +7,39 @@ loadEnvFile(import.meta.url);
 const CANONICAL_KEY = 'wildfire:fires:v1';
 const FIRMS_SOURCES = ['VIIRS_SNPP_NRT', 'VIIRS_NOAA20_NRT', 'VIIRS_NOAA21_NRT'];
 
+// Publish-size ceiling for the detections array. _seed-utils.mjs rejects any
+// payload over MAX_PAYLOAD_BYTES (5MB) AFTER the envelope is added, so this
+// must stay comfortably below it. High fire season across the monitored
+// regions produces 60-90k detections (observed 10.0MB on 2026-08-05) and the
+// seeder then fails 100% of those runs, serving stale data — a bounded,
+// highest-signal subset is strictly better. Thinning keeps possibleExplosion
+// detections first (the panel's headline signal), then highest fire radiative
+// power. Override with FIRE_DETECTIONS_MAX_BYTES.
+const MAX_DETECTIONS_BYTES = (() => {
+  const v = Number(process.env.FIRE_DETECTIONS_MAX_BYTES);
+  return Number.isFinite(v) && v > 0 ? v : 4_500_000;
+})();
+
+export function thinDetections(fireDetections, maxBytes = MAX_DETECTIONS_BYTES) {
+  const bytes = (arr) => Buffer.byteLength(JSON.stringify(arr), 'utf8');
+  let size = bytes(fireDetections);
+  if (size <= maxBytes) return { detections: fireDetections, dropped: 0, size };
+
+  const sorted = [...fireDetections].sort((a, b) => {
+    if (a.possibleExplosion !== b.possibleExplosion) return a.possibleExplosion ? -1 : 1;
+    return (b.frp || 0) - (a.frp || 0);
+  });
+  // First cut proportional to the overshoot, then trim in 10% steps — record
+  // sizes are near-uniform, so this converges in one or two passes.
+  let out = sorted.slice(0, Math.max(1, Math.floor(sorted.length * maxBytes / size)));
+  size = bytes(out);
+  while (size > maxBytes && out.length > 1) {
+    out = out.slice(0, Math.max(1, Math.floor(out.length * 0.9)));
+    size = bytes(out);
+  }
+  return { detections: out, dropped: fireDetections.length - out.length, size };
+}
+
 const MONITORED_REGIONS = {
   'Ukraine': '22,44,40,53',
   'Russia': '20,50,180,82',
@@ -113,7 +146,17 @@ async function fetchAllRegions(apiKey) {
     console.log(`  ${source}: ${fireDetections.length} total (${fulfilled} ok, ${failed} failed)`);
   }
 
-  return { fireDetections, pagination: undefined };
+  const { detections, dropped, size } = thinDetections(fireDetections);
+  if (dropped > 0) {
+    const minFrp = detections.length ? (detections[detections.length - 1].frp || 0) : 0;
+    console.log(
+      `  thinned ${fireDetections.length} -> ${detections.length} detections ` +
+      `(${(size / 1024 / 1024).toFixed(1)}MB, dropped ${dropped} lowest-FRP, kept frp >= ~${minFrp.toFixed(1)}; ` +
+      `all possibleExplosion detections retained)`,
+    );
+  }
+
+  return { fireDetections: detections, pagination: undefined };
 }
 
 export function declareRecords(data) {
@@ -140,7 +183,12 @@ async function main() {
   });
 }
 
-main().catch(err => {
-  const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : ''; console.error('FATAL:', (err.message || err) + _cause);
-  process.exit(1);
-});
+// Same isMain guard as seed-climate-zone-normals.mjs: lets tests import
+// thinDetections/declareRecords without triggering a live seed run.
+const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/^file:\/\//, ''));
+if (isMain) {
+  main().catch(err => {
+    const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : ''; console.error('FATAL:', (err.message || err) + _cause);
+    process.exit(1);
+  });
+}
