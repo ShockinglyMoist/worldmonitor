@@ -100,6 +100,7 @@ run_seed() {
 }
 
 ok=0 fail=0 skip=0 timedout=0
+failed_names=""
 
 # Diagnostics for non-OK seeders. Previously only `tail -1` of a seeder's output
 # survived, which threw away the script's own "FETCH FAILED: …" and per-endpoint
@@ -289,6 +290,7 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
         printf "OK\n"; ok=$((ok + 1))
       else
         printf "FAIL (%s)\n" "$last"; fail=$((fail + 1))
+        failed_names="$failed_names $name"
         record_failure "$name" FAIL "$output"
       fi
       continue ;;
@@ -303,6 +305,7 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
   if caps_seed "$f" && { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; }; then
     printf "TIMEOUT (killed after %ss)\n" "$SEED_TIMEOUT"
     timedout=$((timedout + 1))
+    failed_names="$failed_names $name"
     record_failure "$name" TIMEOUT "$output"
   elif [ "$aviation_gated" -eq 1 ] \
     && echo "$output" | grep -q "intl unpublishable: no AVIATIONSTACK_API key"; then
@@ -322,6 +325,7 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
   else
     printf "FAIL (%s)\n" "$last"
     fail=$((fail + 1))
+    failed_names="$failed_names $name"
     record_failure "$name" FAIL "$output"
   fi
 done
@@ -330,4 +334,72 @@ echo ""
 echo "Done: $ok ok, $skip skipped, $fail failed, $timedout timed out"
 if [ -n "$RUN_LOG" ] && [ "$((fail + timedout))" -gt 0 ]; then
   echo "Full output for the $((fail + timedout)) non-OK seeder(s): $RUN_LOG"
+fi
+
+# Failure alerting (GH #283). Before this, five seeders could fail on every
+# 30-min tick for weeks and the only signal was a FAIL line in the timer's
+# journal — the panels served stale/empty data silently. Publishes to an ntfy
+# topic when seeders fail, with a failure-set signature + cooldown so a chronic
+# failure doesn't page every tick, and a one-shot recovery notice when a
+# previously-alerted state clears.
+#
+# Opt-in: set SEED_ALERT_URL (this script sources .env, so put it there), e.g.
+#   SEED_ALERT_URL=https://ntfy.hippiekiller.net/homelab-alerts
+# Knobs: SEED_ALERT_EXCLUDE — space-separated seeder filenames whose failures
+# never alert (for known-unfixable feeds you've decided to tolerate);
+# SEED_ALERT_REALERT_SEC — re-alert the SAME failure set after this long
+# (default 24h; a NEW/changed failure set alerts immediately).
+# Best-effort by design: alerting must never fail the run.
+SEED_ALERT_URL="${SEED_ALERT_URL:-}"
+SEED_ALERT_EXCLUDE="${SEED_ALERT_EXCLUDE:-}"
+SEED_ALERT_REALERT_SEC="${SEED_ALERT_REALERT_SEC:-86400}"
+
+# node handles TLS/SNI properly everywhere the seeders can run (they require
+# node 24); busybox wget's TLS support varies. $1=title $2=priority $3=tags $4=body
+post_ntfy() {
+  node -e '
+    const [url, title, priority, tags, body] = process.argv.slice(1);
+    fetch(url, { method: "POST", headers: { Title: title, Priority: priority, Tags: tags }, body, signal: AbortSignal.timeout(15000) })
+      .then((r) => process.exit(r.ok ? 0 : 1))
+      .catch(() => process.exit(1));
+  ' "$SEED_ALERT_URL" "$1" "$2" "$3" "$4" 2>/dev/null
+}
+
+if [ -n "$SEED_ALERT_URL" ] && [ -n "$SEED_STATE_DIR" ]; then
+  alert_names=""
+  for _an in $failed_names; do
+    case " $SEED_ALERT_EXCLUDE " in
+      *" $_an "*) ;;
+      *) alert_names="$alert_names $_an" ;;
+    esac
+  done
+  # Normalize to a sorted, space-joined signature so ordering differences
+  # between runs don't look like a new failure set.
+  alert_sig=$(printf '%s\n' $alert_names | sort | tr '\n' ' ')
+  ALERT_STATE="$SEED_STATE_DIR/seed-alert.state"
+
+  if [ -n "$alert_names" ]; then
+    last_ts=0; last_sig=""
+    if [ -f "$ALERT_STATE" ]; then
+      last_ts=$(sed -n 1p "$ALERT_STATE" 2>/dev/null)
+      last_sig=$(sed -n 2p "$ALERT_STATE" 2>/dev/null)
+    fi
+    _age=$(( $(date +%s) - ${last_ts:-0} ))
+    if [ "$alert_sig" != "$last_sig" ] || [ "$_age" -ge "$SEED_ALERT_REALERT_SEC" ]; then
+      _body=$(printf 'Failing:%s\nRun: %s ok, %s skipped, %s failed, %s timed out\nDetail: %s' \
+        "$alert_names" "$ok" "$skip" "$fail" "$timedout" "${RUN_LOG:-journalctl -u worldmonitor-seed}")
+      if post_ntfy "worldmonitor: $((fail + timedout)) seeder(s) failing" high warning "$_body"; then
+        printf '%s\n%s\n' "$(date +%s)" "$alert_sig" > "$ALERT_STATE" 2>/dev/null || true
+        echo "Failure alert published to ntfy"
+      else
+        echo "Failure alert publish FAILED (ntfy unreachable?)" >&2
+      fi
+    fi
+  elif [ -s "$ALERT_STATE" ]; then
+    # Everything that previously alerted now passes — say so once, then clear.
+    post_ntfy "worldmonitor: seeders recovered" default white_check_mark \
+      "All previously-alerted seeders pass again (run: $ok ok, $skip skipped)." \
+      && echo "Recovery notice published to ntfy" || true
+    rm -f "$ALERT_STATE" 2>/dev/null || true
+  fi
 fi
