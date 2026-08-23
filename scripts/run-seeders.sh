@@ -148,6 +148,8 @@ ZONE_NORMALS_MIN_INTERVAL="${ZONE_NORMALS_MIN_INTERVAL:-2592000}"   # 30d
 CLIMATE_ANOMALIES_MIN_INTERVAL="${CLIMATE_ANOMALIES_MIN_INTERVAL:-21600}"  # 6h
 AVIATION_INTL_MIN_INTERVAL="${AVIATION_INTL_MIN_INTERVAL:-21600}"  # 6h
 BUNDLE_CLIMATE_MIN_INTERVAL="${BUNDLE_CLIMATE_MIN_INTERVAL:-21600}"  # 6h
+IMPORT_HHI_MIN_INTERVAL="${IMPORT_HHI_MIN_INTERVAL:-21600}"  # 6h
+BUNDLE_RESILIENCE_RECOVERY_MIN_INTERVAL="${BUNDLE_RESILIENCE_RECOVERY_MIN_INTERVAL:-21600}"  # 6h
 
 # 0 (true) = ran more recently than $2 seconds ago, so skip this pass.
 too_soon() {
@@ -277,6 +279,38 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
         skip=$((skip + 1)); continue
       fi
       mark_attempt "$name" ;;
+    seed-recovery-import-hhi.mjs)
+      # Comtrade quota wall — same shape as the Open-Meteo/AviationStack cases
+      # above (GH #262). The seeder walks 238 reporters against a Comtrade key
+      # whose free daily allowance covers roughly half a full pass; once spent,
+      # every reporter 403s "Out of call volume quota" until the daily
+      # replenish, and an ungated 30-min retry is 238 doomed calls / ~6.5 min
+      # of pacing per tick, ~11k rejected requests a day. Its checkpoint key
+      # (45d resume TTL) accumulates coverage ACROSS due ticks, so a handful of
+      # attempts a day is all it needs to converge; seed-meta then parks it for
+      # the bundle's 30-day cadence. The quota-wall exit is also reclassified
+      # as SKIP below so the accumulation phase neither pages nor flaps the
+      # recovery notice.
+      if too_soon "$name" "$IMPORT_HHI_MIN_INTERVAL"; then
+        printf "SKIP (interval gate: ~%sh until next run; Comtrade daily quota, checkpoint accumulates)\n" \
+          "$(hours_left "$name" "$IMPORT_HHI_MIN_INTERVAL")"
+        skip=$((skip + 1)); continue
+      fi
+      mark_attempt "$name" ;;
+    seed-bundle-resilience-recovery.mjs)
+      # Same bundle pathology as seed-bundle-climate above: _bundle-runner's
+      # per-child gate is success-keyed (seed-meta freshness), so a child
+      # failing BECAUSE its quota is spent — Import-HHI against Comtrade — is
+      # "due" again on every 30-min tick and re-burns its doomed pass inside
+      # the bundle even with the direct gate above in place. Attempt-keyed
+      # stamp at the same 6h; the other seven children are on 30-day cadences
+      # and tolerate the added latency trivially.
+      if too_soon "$name" "$BUNDLE_RESILIENCE_RECOVERY_MIN_INTERVAL"; then
+        printf "SKIP (interval gate: ~%sh until next run; children success-keyed, see GH #262)\n" \
+          "$(hours_left "$name" "$BUNDLE_RESILIENCE_RECOVERY_MIN_INTERVAL")"
+        skip=$((skip + 1)); continue
+      fi
+      mark_attempt "$name" ;;
     seed-bundle-resilience-validation.mjs)
       # Its Sensitivity-Suite child imports ../server/*.ts — plain node can't
       # resolve those; upstream's Dockerfile.seed-bundle-resilience-validation
@@ -316,6 +350,16 @@ for f in "$SCRIPT_DIR"/seed-*.mjs; do
     # FAIL below.
     printf "OK (side-cars ran; intl gated)\n"
     ok=$((ok + 1))
+  elif [ "$name" = "seed-recovery-import-hhi.mjs" ] && [ "$rc" -ne 0 ] \
+    && echo "$output" | grep -q "reporters ended in Comtrade quota/auth status"; then
+    # Expected during the multi-day checkpoint-accumulation phase: the Comtrade
+    # daily quota is spent, every remaining reporter 403s, and the run cannot
+    # validate. That is a time-heals condition (quota replenishes daily, the
+    # checkpoint resumes), not a defect — counting it as FAIL would page on the
+    # first due tick and then flap fail→recovered→fail against the gated ticks.
+    # A failure WITHOUT the quota signature still lands in FAIL below.
+    printf "SKIP (Comtrade quota exhausted; checkpoint resumes next due tick)\n"
+    skip=$((skip + 1))
   elif echo "$last" | grep -qi "skip\|not set\|missing.*key\|not found"; then
     printf "SKIP (%s)\n" "$last"
     skip=$((skip + 1))
